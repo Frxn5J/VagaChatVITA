@@ -1,0 +1,15 @@
+/build/
+/out/
+
+*.self
+*.velf
+*.vpk
+*.sfo
+
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+
+CMakeUserPresets.json
+.vs/

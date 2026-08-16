@@ -1,0 +1,9 @@
+{
+  "cmake.configureOnOpen": false,
+  "C_Cpp.default.cStandard": "c11",
+  "C_Cpp.default.intelliSenseMode": "gcc-arm",
+  "C_Cpp.default.compilerPath": "${env:VITASDK}/bin/arm-vita-eabi-gcc.exe",
+  "files.associations": {
+    "*.inc": "c"
+  }
+}
