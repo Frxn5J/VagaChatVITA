@@ -3,20 +3,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <curl/curl.h>
+
 #include <psp2/ctrl.h>
 #include <psp2/ime_dialog.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
-#include <psp2/net/http.h>
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
-#include <psp2/libssl.h>
 #include <psp2/sysmodule.h>
 #include <psp2/touch.h>
 
 #include <vita2d.h>
+
+#include "chat.h"
 
 #define SCREEN_WIDTH 960
 #define SCREEN_HEIGHT 544
@@ -39,6 +41,7 @@
 #define MODEL_COUNT 8
 #define CONFIG_BUFFER_CAPACITY 4096
 #define NETWORK_MEMORY_SIZE (1024 * 1024)
+#define CA_CERTIFICATE_FILE "app0:assets/cacert.pem"
 
 #define KEYBOARD_ROWS 7
 #define KEYBOARD_COLUMNS 6
@@ -80,8 +83,6 @@ static char selected_model[MODEL_CAPACITY + 1];
 static int model_count;
 static int config_needs_rewrite;
 static char message_text[MESSAGE_CAPACITY + 1];
-static char sent_message[MESSAGE_CAPACITY + 1];
-static char history_messages[HISTORY_CAPACITY][MESSAGE_CAPACITY + 1];
 static char status_message[64];
 static int status_is_error;
 static int screen;
@@ -91,10 +92,13 @@ static int keyboard_row;
 static int keyboard_column;
 static int keyboard_target;
 static int chat_focus;
-static int has_sent_message;
 static int input_mode;
-static int history_count;
 static int history_modal;
+static int history_selection;
+static int chat_scroll_offset;
+static int chat_scroll_max;
+static int chat_follow_bottom = 1;
+static int chat_analog_delay;
 static int info_modal;
 static int side_menu_open;
 static int side_menu_selection;
@@ -103,6 +107,10 @@ static int model_cursor;
 static int model_analog_delay;
 static int connection_state;
 static int network_ready;
+static int net_initialized;
+static int netctl_initialized;
+static int curl_initialized;
+static int net_module_loaded;
 static unsigned char network_memory[NETWORK_MEMORY_SIZE];
 static SceTouchPanelInfo touch_panel;
 static int touch_down;
@@ -365,6 +373,9 @@ static void load_config(void) {
 		}
 		if (strncmp(line, "name=", 5) == 0) {
 			char *embedded_endpoint = strstr(line + 5, "endpoint_url=");
+			if (embedded_endpoint != NULL && embedded_endpoint >= line_end) {
+				embedded_endpoint = NULL;
+			}
 			if (embedded_endpoint != NULL) {
 				int name_length = (int)(embedded_endpoint - (line + 5));
 				if (name_length >= (int)sizeof(user_name)) {
@@ -780,16 +791,171 @@ static void draw_chat_landing(void) {
 	draw_quick_card(732.0f, COLOR_SUCCESS, "Crear imagen", "Genera imagenes", "(beta).");
 }
 
-static void draw_chat_history(void) {
-	draw_border_width(145.0f, 121.0f, 775.0f, 300.0f, 17.0f, 2.0f, COLOR_CARD_EDGE, RGBA8(11, 15, 30, 255));
-	draw_text(173.0f, 160.0f, 1.2f, COLOR_TEXT, "Conversacion activa");
-	draw_text(173.0f, 184.0f, 0.78f, COLOR_MUTED, "Modo local preparado para VagaRoute AI.");
+static int next_chat_line(const char *text, int *offset, char *line, int capacity, float width) {
+	int source = *offset;
+	int start = source;
+	int line_length = 0;
+	int last_space = -1;
+	if (text[source] == '\0') {
+		return 0;
+	}
+	if (text[source] == '\n') {
+		line[0] = '\0';
+		*offset = source + 1;
+		return 1;
+	}
+	while (text[source] != '\0' && line_length < capacity - 1) {
+		if (text[source] == '\n') {
+			++source;
+			break;
+		}
+		int previous_source = source;
+		int sequence = ((unsigned char)text[source] & 0x80) == 0 ? 1 :
+			(((unsigned char)text[source] & 0xE0) == 0xC0 ? 2 :
+			((unsigned char)text[source] & 0xF0) == 0xE0 ? 3 : 4);
+		if (line_length + sequence >= capacity) {
+			break;
+		}
+		for (int byte = 0; byte < sequence && text[source] != '\0'; ++byte) {
+			line[line_length++] = text[source++];
+		}
+		line[line_length] = '\0';
+		if (line[line_length - 1] == ' ') {
+			last_space = line_length - 1;
+		}
+		if (text_width(0.70f, line) > width) {
+			if (last_space > 0) {
+				line_length = last_space;
+				source = start + last_space + 1;
+			} else if (line_length > sequence) {
+				line_length -= sequence;
+				source = previous_source;
+			}
+			break;
+		}
+	}
+	while (line_length > 0 && line[line_length - 1] == ' ') {
+		--line_length;
+	}
+	line[line_length] = '\0';
+	if (source == start) {
+		source += 1;
+	}
+	*offset = source;
+	return 1;
+}
 
-	draw_round_rect(530.0f, 205.0f, 350.0f, 52.0f, 10.0f, RGBA8(45, 37, 61, 255));
-	draw_text_fit(550.0f, 237.0f, 310.0f, 0.86f, COLOR_TEXT, sent_message);
-	draw_round_rect(173.0f, 279.0f, 440.0f, 58.0f, 10.0f, RGBA8(19, 31, 48, 255));
-	draw_text(192.0f, 307.0f, 0.86f, COLOR_SUCCESS, "VagaRoute AI");
-	draw_text(192.0f, 327.0f, 0.76f, COLOR_MUTED, "Mensaje recibido. Conecta tu modelo para responder.");
+static int chat_line_count(const char *text, float width) {
+	char line[192];
+	int offset = 0;
+	int count = 0;
+	while (next_chat_line(text, &offset, line, sizeof(line), width)) {
+		++count;
+	}
+	return count > 0 ? count : 1;
+}
+
+static void draw_chat_message(int index, int count, int y, int height) {
+	ChatRole role = CHAT_ROLE_USER;
+	char content[CHAT_MAX_MESSAGE_BYTES + 1];
+	if (chat_copy_message(index, &role, content, sizeof(content)) < 0) {
+		return;
+	}
+	const int bubble_width = role == CHAT_ROLE_USER ? 500 : 610;
+	const int bubble_x = role == CHAT_ROLE_USER ? 397 : 166;
+	uint32_t bubble_color = role == CHAT_ROLE_USER ? RGBA8(49, 38, 58, 255) : RGBA8(26, 46, 47, 255);
+	uint32_t role_color = role == CHAT_ROLE_USER ? COLOR_ACCENT : COLOR_SUCCESS;
+	draw_round_rect((float)bubble_x, (float)y, (float)bubble_width, (float)height, 12.0f, bubble_color);
+	draw_text((float)bubble_x + 16.0f, (float)y + 21.0f, 0.66f, role_color,
+		role == CHAT_ROLE_USER ? "Tu" : "VagaRoute AI");
+
+	char line[192];
+	int source = 0;
+	int line_number = 0;
+	const float text_width_limit = (float)bubble_width - 32.0f;
+	while (next_chat_line(content, &source, line, sizeof(line), text_width_limit)) {
+		draw_text((float)bubble_x + 16.0f, (float)y + 43.0f + line_number * 20.0f,
+			0.70f, COLOR_TEXT, line[0] != '\0' ? line : " ");
+		++line_number;
+	}
+	if (line_number == 0) {
+		draw_text((float)bubble_x + 16.0f, (float)y + 43.0f, 0.70f, COLOR_MUTED, "...");
+	}
+
+	char counter[24];
+	int counter_length = 0;
+	if (index + 1 >= 10) {
+		counter[counter_length++] = (char)('0' + (index + 1) / 10);
+	}
+	counter[counter_length++] = (char)('0' + (index + 1) % 10);
+	counter[counter_length++] = '/';
+	if (count >= 10) {
+		counter[counter_length++] = (char)('0' + count / 10);
+	}
+	counter[counter_length++] = (char)('0' + count % 10);
+	counter[counter_length] = '\0';
+	draw_text((float)(bubble_x + bubble_width - 49), (float)y + 21.0f, 0.60f, COLOR_MUTED, counter);
+}
+
+static void draw_chat_history(void) {
+	const int view_left = 158;
+	const int view_top = 115;
+	const int view_right = 907;
+	const int view_bottom = 405;
+	const int view_height = view_bottom - view_top;
+	const int message_gap = 10;
+	int heights[CHAT_MAX_MESSAGES] = { 0 };
+	int count = chat_message_count();
+	int total_height = 0;
+
+	draw_border_width(145.0f, 110.0f, 775.0f, 310.0f, 17.0f, 2.0f, COLOR_CARD_EDGE, RGBA8(11, 15, 30, 255));
+	for (int index = 0; index < count && index < CHAT_MAX_MESSAGES; ++index) {
+		ChatRole role = CHAT_ROLE_USER;
+		char content[CHAT_MAX_MESSAGE_BYTES + 1];
+		if (chat_copy_message(index, &role, content, sizeof(content)) < 0) {
+			content[0] = '\0';
+		}
+		int bubble_width = role == CHAT_ROLE_USER ? 500 : 610;
+		heights[index] = 34 + chat_line_count(content, (float)bubble_width - 32.0f) * 20;
+		if (heights[index] < 54) {
+			heights[index] = 54;
+		}
+		total_height += heights[index];
+	}
+	if (count > 1) {
+		total_height += (count - 1) * message_gap;
+	}
+	chat_scroll_max = total_height > view_height ? total_height - view_height : 0;
+	if (chat_follow_bottom) {
+		chat_scroll_offset = chat_scroll_max;
+	}
+	if (chat_scroll_offset > chat_scroll_max) {
+		chat_scroll_offset = chat_scroll_max;
+	}
+	if (chat_scroll_offset < 0) {
+		chat_scroll_offset = 0;
+	}
+	int content_y = total_height < view_height ? view_top + 12 : view_top - chat_scroll_offset;
+
+	vita2d_set_clip_rectangle(view_left, view_top, view_right, view_bottom);
+	vita2d_enable_clipping();
+	for (int index = 0; index < count && index < CHAT_MAX_MESSAGES; ++index) {
+		draw_chat_message(index, count, content_y, heights[index]);
+		content_y += heights[index] + message_gap;
+	}
+	vita2d_disable_clipping();
+
+	if (chat_scroll_max > 0) {
+		uint32_t scroll_color = COLOR_MUTED;
+		if (chat_scroll_offset > 0) {
+			vita2d_draw_line(894.0f, 128.0f, 889.0f, 134.0f, scroll_color);
+			vita2d_draw_line(889.0f, 134.0f, 899.0f, 134.0f, scroll_color);
+		}
+		if (chat_scroll_offset < chat_scroll_max) {
+			vita2d_draw_line(889.0f, 389.0f, 899.0f, 389.0f, scroll_color);
+			vita2d_draw_line(899.0f, 389.0f, 894.0f, 395.0f, scroll_color);
+		}
+	}
 }
 
 static void draw_history_modal(void) {
@@ -799,16 +965,20 @@ static void draw_history_modal(void) {
 	draw_text(205.0f, 164.0f, 0.76f, COLOR_MUTED, "Conversaciones guardadas en esta sesion.");
 	draw_close_icon(744.0f, 109.0f, COLOR_MUTED);
 
-	if (history_count == 0) {
+	int conversation_count = chat_conversation_count();
+	if (conversation_count == 0) {
 		draw_text(205.0f, 245.0f, 0.9f, COLOR_MUTED, "Aun no hay conversaciones.");
 	} else {
-		for (int row = 0; row < history_count; ++row) {
-			int history_index = history_count - row - 1;
+		for (int row = 0; row < conversation_count; ++row) {
+			int history_index = conversation_count - row - 1;
 			float y = 184.0f + row * 64.0f;
-			draw_border(205.0f, y, 550.0f, 52.0f, 9.0f, COLOR_CARD_EDGE, RGBA8(19, 23, 43, 255));
+			uint32_t border = history_index == history_selection ? COLOR_ACCENT : COLOR_CARD_EDGE;
+			draw_border(205.0f, y, 550.0f, 52.0f, 9.0f, border, RGBA8(19, 23, 43, 255));
 			draw_sidebar_icon(222.0f, y + 13.0f, 0, COLOR_ACCENT_SOFT);
-			draw_text(262.0f, y + 22.0f, 0.72f, COLOR_MUTED, "Chat local");
-			draw_text_fit(262.0f, y + 42.0f, 450.0f, 0.76f, COLOR_TEXT, history_messages[history_index]);
+			char title[CHAT_MAX_TITLE_BYTES + 1];
+			chat_copy_conversation_title(history_index, title, sizeof(title));
+			draw_text(262.0f, y + 22.0f, 0.72f, COLOR_MUTED, history_index == chat_active_conversation() ? "Conversacion activa" : "Conversacion guardada");
+			draw_text_fit(262.0f, y + 42.0f, 450.0f, 0.76f, COLOR_TEXT, title);
 		}
 	}
 }
@@ -855,14 +1025,20 @@ static void activate_side_menu(void) {
 
 	if (side_menu_selection == 0) {
 		message_text[0] = '\0';
-		sent_message[0] = '\0';
-		has_sent_message = 0;
+		if (chat_new_conversation() < 0) {
+			set_status("CANCELA LA RESPUESTA ANTES DE CREAR OTRO CHAT.", 1);
+			screen = SCREEN_CHAT;
+			return;
+		}
+		chat_follow_bottom = 1;
+		chat_scroll_offset = 0;
 		screen = user_name[0] == '\0' ? SCREEN_NAME : SCREEN_CHAT;
 	} else if (side_menu_selection == 1) {
 		if (user_name[0] != '\0') {
 			screen = SCREEN_CHAT;
 		}
 		history_modal = 1;
+		history_selection = chat_active_conversation();
 	} else if (side_menu_selection == 2) {
 		info_modal = 1;
 	} else {
@@ -968,9 +1144,11 @@ static void draw_chat_interface(void) {
 	draw_background();
 	draw_chat_header();
 	draw_chat_sidebar(0);
-	if (has_sent_message) {
+	if (chat_message_count() > 0) {
 		draw_chat_history();
 	} else {
+		chat_scroll_offset = 0;
+		chat_scroll_max = 0;
 		draw_chat_landing();
 	}
 	if (status_message[0] != '\0') {
@@ -1318,25 +1496,25 @@ static void send_message(void) {
 		return;
 	}
 
-	if (history_count == HISTORY_CAPACITY) {
-		for (int index = 1; index < HISTORY_CAPACITY; ++index) {
-			strncpy(history_messages[index - 1], history_messages[index], MESSAGE_CAPACITY);
-			history_messages[index - 1][MESSAGE_CAPACITY] = '\0';
-		}
-		--history_count;
+	if (selected_model[0] == '\0') {
+		set_status("SELECCIONA UN MODELO.", 1);
+		return;
 	}
-	size_t message_length = strlen(message_text);
-	if (message_length > MESSAGE_CAPACITY) {
-		message_length = MESSAGE_CAPACITY;
+	if (input_mode != 0) {
+		set_status("LA GENERACION DE IMAGENES SIGUE EN BETA.", 1);
+		return;
 	}
-	memcpy(history_messages[history_count], message_text, message_length);
-	history_messages[history_count][message_length] = '\0';
-	++history_count;
-	strncpy(sent_message, message_text, sizeof(sent_message) - 1);
-	sent_message[sizeof(sent_message) - 1] = '\0';
+	if (chat_send(endpoint_url, api_key, selected_model, message_text) < 0) {
+		char chat_status[64];
+		chat_copy_status(chat_status, sizeof(chat_status));
+		set_status(chat_request_state() == CHAT_REQUEST_STREAMING ? "ESPERA O CANCELA LA RESPUESTA." :
+			chat_status[0] != '\0' ? chat_status : "NO SE PUDO ENVIAR.", 1);
+		return;
+	}
 	message_text[0] = '\0';
-	has_sent_message = 1;
-	set_status("MENSAJE ENVIADO.", 0);
+	chat_follow_bottom = 1;
+	chat_scroll_offset = 0;
+	set_status("GENERANDO RESPUESTA...", 0);
 }
 
 static int build_models_url(char *output, int capacity) {
@@ -1403,61 +1581,106 @@ static int parse_models_json(const char *json, char output[MODEL_COUNT][MODEL_CA
 	return count;
 }
 
-static int http_get_models(const char *url, const char *key, char *response, int capacity, int *status_code) {
-	int template_id = -1;
-	int connection_id = -1;
-	int request_id = -1;
-	int result = -1;
-	template_id = sceHttpCreateTemplate("VagaChatVITA/1.0", SCE_HTTP_VERSION_1_1, SCE_HTTP_PROXY_AUTO);
-	if (template_id < 0) {
-		return -1;
-	}
-	connection_id = sceHttpCreateConnectionWithURL(template_id, url, 0);
-	if (connection_id < 0) {
-		goto cleanup;
-	}
-	request_id = sceHttpCreateRequestWithURL(connection_id, SCE_HTTP_METHOD_GET, url, 0);
-	if (request_id < 0) {
-		goto cleanup;
-	}
-	char authorization[API_KEY_CAPACITY + 9] = "Bearer ";
-	strncat(authorization, key, sizeof(authorization) - strlen(authorization) - 1);
-	if (sceHttpAddRequestHeader(request_id, "Authorization", authorization, SCE_HTTP_HEADER_OVERWRITE) < 0 ||
-		sceHttpAddRequestHeader(request_id, "Accept", "application/json", SCE_HTTP_HEADER_OVERWRITE) < 0 ||
-		sceHttpSendRequest(request_id, NULL, 0) < 0) {
-		goto cleanup;
-	}
-	if (sceHttpGetStatusCode(request_id, status_code) < 0 || *status_code < 200 || *status_code >= 300) {
-		goto cleanup;
-	}
-	int total = 0;
-	while (total < capacity - 1) {
-		int read = sceHttpReadData(request_id, response + total, capacity - total - 1);
-		if (read < 0) {
-			goto cleanup;
-		}
-		if (read == 0) {
-			break;
-		}
-		total += read;
-	}
-	response[total] = '\0';
-	if (total == 0) {
-		goto cleanup;
-	}
-	result = 0;
+typedef struct {
+	char *data;
+	size_t capacity;
+	size_t length;
+} HttpResponse;
 
-cleanup:
-	if (request_id >= 0) {
-		sceHttpDeleteRequest(request_id);
+static size_t write_http_response(char *data, size_t size, size_t count, void *user_data) {
+	HttpResponse *response = user_data;
+	size_t bytes = size * count;
+	if (bytes > response->capacity - response->length - 1) {
+		return 0;
 	}
-	if (connection_id >= 0) {
-		sceHttpDeleteConnection(connection_id);
+	memcpy(response->data + response->length, data, bytes);
+	response->length += bytes;
+	response->data[response->length] = '\0';
+	return bytes;
+}
+
+static int http_get_models(const char *url, const char *key, char *response, int capacity, int *status_code) {
+	CURL *curl = curl_easy_init();
+	if (curl == NULL) {
+		return CURLE_FAILED_INIT;
 	}
-	if (template_id >= 0) {
-		sceHttpDeleteTemplate(template_id);
+
+	char authorization[API_KEY_CAPACITY + 23] = "Authorization: Bearer ";
+	size_t authorization_length = strlen(authorization);
+	size_t key_length = strlen(key);
+	if (key_length > sizeof(authorization) - authorization_length - 1) {
+		key_length = sizeof(authorization) - authorization_length - 1;
 	}
-	return result;
+	memcpy(authorization + authorization_length, key, key_length);
+	authorization[authorization_length + key_length] = '\0';
+	struct curl_slist *headers = NULL;
+	headers = curl_slist_append(headers, authorization);
+	if (headers == NULL) {
+		curl_easy_cleanup(curl);
+		return CURLE_OUT_OF_MEMORY;
+	}
+	struct curl_slist *updated_headers = curl_slist_append(headers, "Accept: application/json");
+	if (updated_headers == NULL) {
+		curl_slist_free_all(headers);
+		curl_easy_cleanup(curl);
+		return CURLE_OUT_OF_MEMORY;
+	}
+	headers = updated_headers;
+
+	HttpResponse body = { response, (size_t)capacity, 0 };
+	response[0] = '\0';
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, "VagaChatVITA/1.1");
+	curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+	curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+	curl_easy_setopt(curl, CURLOPT_CAINFO, CA_CERTIFICATE_FILE);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_http_response);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+
+	CURLcode result = curl_easy_perform(curl);
+	long response_code = 0;
+	if (result == CURLE_OK) {
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+	}
+	*status_code = (int)response_code;
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+
+	if (result != CURLE_OK) {
+		return result;
+	}
+	if (*status_code < 200 || *status_code >= 300) {
+		return CURLE_HTTP_RETURNED_ERROR;
+	}
+	return body.length > 0 ? CURLE_OK : CURLE_GOT_NOTHING;
+}
+
+static const char *connection_error_message(int error) {
+	if (error == CURLE_PEER_FAILED_VERIFICATION) {
+		return "CERTIFICADO TLS INVALIDO.";
+	}
+	if (error == CURLE_SSL_CONNECT_ERROR) {
+		return "FALLO HANDSHAKE TLS.";
+	}
+	if (error == CURLE_COULDNT_RESOLVE_HOST) {
+		return "NO SE RESOLVIO EL HOST.";
+	}
+	if (error == CURLE_COULDNT_CONNECT) {
+		return "NO SE PUDO CONECTAR.";
+	}
+	if (error == CURLE_OPERATION_TIMEDOUT) {
+		return "TIEMPO DE CONEXION AGOTADO.";
+	}
+	if (error == CURLE_WRITE_ERROR) {
+		return "RESPUESTA DEMASIADO GRANDE.";
+	}
+	return "ERROR DE CONEXION.";
 }
 
 static int verify_connection(void) {
@@ -1465,6 +1688,11 @@ static int verify_connection(void) {
 	if (endpoint_url[0] == '\0' || api_key[0] == '\0') {
 		connection_state = CONNECTION_OFFLINE;
 		set_status("CONFIGURA ENDPOINT Y API KEY.", 1);
+		return -1;
+	}
+	if (strncmp(endpoint_url, "https://", 8) != 0) {
+		connection_state = CONNECTION_OFFLINE;
+		set_status("EL ENDPOINT DEBE USAR HTTPS.", 1);
 		return -1;
 	}
 	if (!network_ready) {
@@ -1486,9 +1714,10 @@ static int verify_connection(void) {
 		set_status("ENDPOINT INVALIDO.", 1);
 		return -1;
 	}
-	if (http_get_models(url, api_key, response, sizeof(response), &status_code) < 0) {
+	int request_error = http_get_models(url, api_key, response, sizeof(response), &status_code);
+	if (request_error != CURLE_OK) {
 		connection_state = CONNECTION_OFFLINE;
-		set_status(status_code >= 400 ? "ERROR HTTP." : "SIN CONEXION.", 1);
+		set_status(status_code >= 400 ? "API KEY O ENDPOINT RECHAZADO." : connection_error_message(request_error), 1);
 		return -1;
 	}
 	char new_models[MODEL_COUNT][MODEL_CAPACITY + 1] = { 0 };
@@ -1552,23 +1781,31 @@ int main(void) {
 	sceCommonDialogConfigParamInit(&common_dialog_config);
 	sceCommonDialogSetConfigParam(&common_dialog_config);
 	ime_module_loaded = sceSysmoduleLoadModule(SCE_SYSMODULE_IME) >= 0;
-	if (sceSysmoduleLoadModule(SCE_SYSMODULE_NET) >= 0 &&
-		sceSysmoduleLoadModule(SCE_SYSMODULE_HTTP) >= 0 &&
-		sceSysmoduleLoadModule(SCE_SYSMODULE_SSL) >= 0 &&
-		sceSysmoduleLoadModule(SCE_SYSMODULE_HTTPS) >= 0) {
+	if (sceSysmoduleLoadModule(SCE_SYSMODULE_NET) >= 0) {
+		net_module_loaded = 1;
 		SceNetInitParam net_param = { network_memory, sizeof(network_memory), 0 };
-		network_ready = sceNetInit(&net_param) >= 0 &&
-			sceNetCtlInit() >= 0 &&
-			sceHttpInit(1024 * 1024) >= 0 &&
-			sceSslInit(1024 * 1024) >= 0;
+		net_initialized = sceNetInit(&net_param) >= 0;
+		if (net_initialized) {
+			netctl_initialized = sceNetCtlInit() >= 0;
+		}
+		if (netctl_initialized) {
+			curl_initialized = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+		}
+		network_ready = curl_initialized;
 	}
 
 	sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
 	memset(&touch_panel, 0, sizeof(touch_panel));
 	sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &touch_panel);
 	sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
-	verify_connection();
+	if (chat_init() < 0) {
+		set_status("NO SE PUDO CARGAR EL HISTORIAL.", 1);
+	} else {
+		chat_follow_bottom = 1;
+		chat_scroll_offset = 0;
+	}
 	uint32_t previous_buttons = 0;
+	ChatRequestState previous_chat_state = chat_request_state();
 
 	for (;;) {
 		SceCtrlData controller = { 0 };
@@ -1578,6 +1815,20 @@ int main(void) {
 		int touch_x = 0;
 		int touch_y = 0;
 		int touch_tapped = read_touch_tap(&touch_x, &touch_y);
+		chat_update();
+		ChatRequestState current_chat_state = chat_request_state();
+		if (current_chat_state != previous_chat_state) {
+			char chat_status[64];
+			char chat_error[128];
+			chat_copy_status(chat_status, sizeof(chat_status));
+			chat_copy_error(chat_error, sizeof(chat_error));
+			if (current_chat_state == CHAT_REQUEST_ERROR && chat_error[0] != '\0') {
+				set_status(chat_error, 1);
+			} else if (chat_status[0] != '\0') {
+				set_status(chat_status, current_chat_state == CHAT_REQUEST_ERROR);
+			}
+			previous_chat_state = current_chat_state;
+		}
 
 		if (ime_open) {
 			update_ime_dialog();
@@ -1679,6 +1930,25 @@ int main(void) {
 				if (point_in_rect(touch_x, touch_y, 730.0f, 98.0f, 54.0f, 54.0f) ||
 					!point_in_rect(touch_x, touch_y, 170.0f, 86.0f, 620.0f, 374.0f)) {
 					history_modal = 0;
+				} else if (touch_x >= 205 && touch_x < 755 && touch_y >= 184) {
+					int row = (touch_y - 184) / 64;
+					int index = chat_conversation_count() - row - 1;
+					if (index >= 0 && chat_select_conversation(index) == 0) {
+						history_selection = index;
+						history_modal = 0;
+						chat_follow_bottom = 1;
+						chat_scroll_offset = 0;
+					}
+				}
+			} else if ((pressed & SCE_CTRL_UP) != 0 && chat_conversation_count() > 0) {
+				history_selection = (history_selection + 1) % chat_conversation_count();
+			} else if ((pressed & SCE_CTRL_DOWN) != 0 && chat_conversation_count() > 0) {
+				history_selection = (history_selection + chat_conversation_count() - 1) % chat_conversation_count();
+			} else if ((pressed & SCE_CTRL_CROSS) != 0) {
+				if (chat_select_conversation(history_selection) == 0) {
+					history_modal = 0;
+					chat_follow_bottom = 1;
+					chat_scroll_offset = 0;
 				}
 			} else if ((pressed & SCE_CTRL_CIRCLE) != 0 || (pressed & SCE_CTRL_TRIANGLE) != 0) {
 				history_modal = 0;
@@ -1790,6 +2060,28 @@ int main(void) {
 				} else if (point_in_rect(touch_x, touch_y, 480.0f, 45.0f, 340.0f, 50.0f)) {
 					open_model_selector();
 				}
+			} else if ((pressed & SCE_CTRL_CIRCLE) != 0 &&
+				(chat_request_state() == CHAT_REQUEST_CONNECTING || chat_request_state() == CHAT_REQUEST_STREAMING)) {
+				chat_cancel();
+				set_status("CANCELANDO RESPUESTA...", 0);
+			} else if ((pressed & SCE_CTRL_LTRIGGER) != 0) {
+				chat_follow_bottom = 0;
+				chat_scroll_offset -= 220;
+				if (chat_scroll_offset < 0) chat_scroll_offset = 0;
+			} else if ((pressed & SCE_CTRL_RTRIGGER) != 0) {
+				chat_follow_bottom = 0;
+				chat_scroll_offset += 220;
+				if (chat_scroll_offset > chat_scroll_max) chat_scroll_offset = chat_scroll_max;
+				if (chat_scroll_offset == chat_scroll_max) chat_follow_bottom = 1;
+			} else if ((pressed & SCE_CTRL_LEFT) != 0) {
+				chat_follow_bottom = 0;
+				chat_scroll_offset -= 80;
+				if (chat_scroll_offset < 0) chat_scroll_offset = 0;
+			} else if ((pressed & SCE_CTRL_RIGHT) != 0) {
+				chat_follow_bottom = 0;
+				chat_scroll_offset += 80;
+				if (chat_scroll_offset > chat_scroll_max) chat_scroll_offset = chat_scroll_max;
+				if (chat_scroll_offset == chat_scroll_max) chat_follow_bottom = 1;
 			} else if ((pressed & SCE_CTRL_UP) != 0 || (pressed & SCE_CTRL_DOWN) != 0) {
 				chat_focus = (chat_focus + 1) % 3;
 			} else if ((pressed & SCE_CTRL_CROSS) != 0) {
@@ -1802,6 +2094,22 @@ int main(void) {
 				}
 			} else if ((pressed & SCE_CTRL_TRIANGLE) != 0) {
 				open_model_selector();
+			} else {
+				int analog_delta = (int)controller.ly - 128;
+				if (analog_delta < -32 || analog_delta > 32) {
+					if (chat_analog_delay <= 0) {
+						chat_follow_bottom = 0;
+						chat_scroll_offset += analog_delta > 0 ? 60 : -60;
+						if (chat_scroll_offset < 0) chat_scroll_offset = 0;
+						if (chat_scroll_offset > chat_scroll_max) chat_scroll_offset = chat_scroll_max;
+						if (chat_scroll_offset == chat_scroll_max) chat_follow_bottom = 1;
+						chat_analog_delay = 3;
+					} else {
+						--chat_analog_delay;
+					}
+				} else {
+					chat_analog_delay = 0;
+				}
 			}
 		}
 
@@ -1821,14 +2129,17 @@ int main(void) {
 	if (ime_module_loaded) {
 		sceSysmoduleUnloadModule(SCE_SYSMODULE_IME);
 	}
-	if (network_ready) {
-		sceSslTerm();
-		sceHttpTerm();
+	chat_shutdown();
+	if (curl_initialized) {
+		curl_global_cleanup();
+	}
+	if (netctl_initialized) {
 		sceNetCtlTerm();
+	}
+	if (net_initialized) {
 		sceNetTerm();
-		sceSysmoduleUnloadModule(SCE_SYSMODULE_HTTPS);
-		sceSysmoduleUnloadModule(SCE_SYSMODULE_SSL);
-		sceSysmoduleUnloadModule(SCE_SYSMODULE_HTTP);
+	}
+	if (net_module_loaded) {
 		sceSysmoduleUnloadModule(SCE_SYSMODULE_NET);
 	}
 	if (app_logo != NULL) {

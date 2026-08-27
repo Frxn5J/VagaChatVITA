@@ -23,20 +23,26 @@
 
 **VagaChatVITA** es una aplicacion homebrew escrita en C que lleva la experiencia de VagaRoute AI a PlayStation Vita. La interfaz esta disenada para la pantalla de la consola, con navegacion por botones, soporte tactil y una apariencia oscura inspirada en un cliente de chat moderno.
 
-Al iniciar, la aplicacion solicita el nombre del usuario y lo guarda localmente en la Vita. Despues abre una pantalla de chat con compositor, historial, ajustes de endpoint, API key enmascarada y selector de modelos.
+Al iniciar, la aplicacion solicita el nombre del usuario y lo guarda localmente en la Vita. Despues abre una pantalla de chat con compositor, historial persistente, ajustes de endpoint, API key enmascarada y selector de modelos.
 
-> **Estado actual:** el envio de mensajes se muestra localmente como prueba de interfaz. La opcion `Verificar conexion` consulta `/models` en el endpoint configurado.
+El chat utiliza la API `chat/completions` compatible con OpenAI, recibe respuestas por streaming y mantiene la interfaz activa mientras genera. La opcion `Verificar conexion` consulta `/models` en el endpoint configurado.
 
 ## Caracteristicas
 
 - Pantalla inicial con teclado oficial de Vita para guardar el nombre del usuario.
-- Interfaz de chat con tarjetas de inicio, compositor, mensajes locales e historial.
+- Chat OpenAI-compatible con respuestas progresivas por streaming.
+- Historial local persistente de hasta cuatro conversaciones.
+- Historial de mensajes en formato vertical con desplazamiento por botones y stick analogico.
+- Logs separados por sesion en `ux0:data/vagachatvita/logs` sin almacenar la API key.
 - Panel de ajustes con endpoint URL, API key enmascarada y modelos disponibles.
 - Verificacion de conexion contra el endpoint configurado.
 - Navegacion con botones, pantalla tactil y teclado oficial de PlayStation Vita.
 - Renderizado 2D acelerado por GPU mediante `libvita2d`.
 - Tipografia Manrope incluida en el VPK con su licencia OFL.
 - Logo PNG y SVG empaquetados dentro de la aplicacion.
+- README incluido dentro del VPK para referencia desde VitaShell.
+- El icono de LiveArea usa `assets/vagaroute-logo.png`, el mismo logo que la interfaz.
+- El fondo de LiveArea usa `fondo.png` al abrir la burbuja de la aplicacion.
 - Generacion de ejecutables `.self` y paquetes `.vpk` para VitaShell.
 - Compilacion automatizada con GitHub Actions y la imagen oficial de VitaSDK.
 
@@ -52,6 +58,7 @@ Para compilar en Windows necesitas:
 | Ninja | Necesario para el script de compilacion |
 | VitaSDK | Compilador, headers y librerias para Vita |
 | `libvita2d` | Libreria de renderizado utilizada por la interfaz |
+| `curl`, `openssl`, `zstd` | Cliente HTTPS con TLS moderno y sus dependencias |
 
 Para probar el resultado necesitas una PS Vita o PS TV preparada para ejecutar homebrew y VitaShell. El metodo de exploit, el firmware y la configuracion de la consola quedan fuera de este proyecto.
 
@@ -59,7 +66,7 @@ VitaSDK no se incluye en el repositorio. Si `libvita2d` no esta instalado, ejecu
 
 ```powershell
 $env:VITASDK = "$HOME\vitasdk"
-& "$env:VITASDK\bin\vdpm.exe" pacman -- --noconfirm --sync libvita2d
+& "$env:VITASDK\bin\vdpm.exe" pacman -- --noconfirm --sync libvita2d curl openssl zstd
 ```
 
 ## Instalar VitaSDK
@@ -126,6 +133,12 @@ La configuracion se guarda localmente en:
 ux0:data/VagaRouteAI/config.ini
 ```
 
+Los logs de cada ejecucion se guardan en:
+
+```text
+ux0:data/vagachatvita/logs/session-<tick>.log
+```
+
 ## Controles
 
 <details>
@@ -149,12 +162,16 @@ ux0:data/VagaRouteAI/config.ini
 | --- | --- |
 | `ARRIBA` / `ABAJO` | Cambiar entre el compositor y `Enviar` |
 | `CRUZ` en el compositor | Abrir el teclado oficial |
-| `CRUZ` en `Enviar` | Mostrar el mensaje en la conversacion local |
+| `CRUZ` en `Enviar` | Enviar el mensaje al modelo seleccionado |
 | `SELECT` | Abrir el menu lateral |
 | `CIRCULO` | Cancelar el teclado o cerrar el historial |
 | `TRIANGULO` | Borrar el ultimo caracter del mensaje |
 | `START` | Guardar el nombre y salir |
 | Pantalla tactil | Tocar el compositor, `Enviar` o el reloj |
+| `CIRCULO` durante una respuesta | Cancelar la generacion |
+| `L` / `R` | Desplazar el historial hacia arriba o abajo |
+| `IZQUIERDA` / `DERECHA` | Desplazamiento corto del historial |
+| Stick analogico vertical | Desplazamiento progresivo del historial |
 
 ### Ajustes
 
@@ -172,7 +189,9 @@ ux0:data/VagaRouteAI/config.ini
 
 ```text
 .
+├── fondo.png
 ├── assets/
+│   ├── cacert.pem
 │   ├── Manrope.ttf
 │   ├── OFL-Manrope.txt
 │   ├── vagaroute-logo.png
@@ -182,6 +201,8 @@ ux0:data/VagaRouteAI/config.ini
 │   ├── build.ps1
 │   └── setup-vitasdk.ps1
 ├── src/
+│   ├── chat.c
+│   ├── chat.h
 │   └── main.c
 ├── .github/workflows/build.yml
 ├── CMakeLists.txt
@@ -206,12 +227,13 @@ VitaSDK recomienda WSL2 para Windows. Dentro de Ubuntu instala `git`, `cmake` y 
 
 - **`VITASDK is not defined`:** ejecuta `. .\scripts\activate-vitasdk.ps1` en la misma terminal donde compilas.
 - **`CMake is required`:** instala CMake y abre una terminal nueva para actualizar `PATH`.
-- **Falta `libvita2d`:** instala el paquete con `vdpm pacman -- --noconfirm --sync libvita2d`.
+- **Faltan librerias:** instala los paquetes con `vdpm pacman -- --noconfirm --sync libvita2d curl openssl zstd`.
 - **Error de `TITLE_ID`:** usa exactamente nueve caracteres ASCII en mayusculas.
 - **La Vita no muestra la aplicacion:** confirma que VitaShell instalo el `.vpk` completo y que la consola puede ejecutar homebrew.
 
 ## Licencias y recursos
 
 - La fuente Manrope se distribuye junto a su licencia en `assets/OFL-Manrope.txt`.
+- El paquete incluye el bundle de autoridades certificadoras de Mozilla publicado por curl para validar HTTPS.
 - VitaSDK, `libvita2d` y las demas librerias de Vita son dependencias externas con sus propias licencias.
 - El logo utilizado en este README y dentro del VPK es `assets/vagaroute-logo.png`.

@@ -25,23 +25,35 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 set(VITA_APP_NAME "VagaRoute AI")
 # Vita title IDs are exactly nine characters and should be unique per app.
 set(VITA_TITLEID "VAGROUTE1")
-set(VITA_VERSION "01.00")
+set(VITA_VERSION "02.00")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 
 add_executable(${PROJECT_NAME}
+  src/chat.c
   src/main.c
 )
 
 target_compile_options(${PROJECT_NAME} PRIVATE
   -Wall
   -Wextra
+  -DCURL_STATICLIB
+  -ffunction-sections
+  -fdata-sections
+)
+
+target_link_options(${PROJECT_NAME} PRIVATE
+  -Wl,--gc-sections
 )
 
 target_link_libraries(${PROJECT_NAME}
   vita2d
+  curl
+  ssl
+  crypto
+  zstd
   SceDisplay_stub
   SceGxm_stub
   SceSysmodule_stub
@@ -50,13 +62,17 @@ target_link_libraries(${PROJECT_NAME}
   SceIme_stub
   SceNet_stub
   SceNetCtl_stub
-  SceHttp_stub
-  SceSsl_stub
   ScePgf_stub
   ScePvf_stub
   SceCommonDialog_stub
   SceAppMgr_stub
   SceIofilemgr_stub
+  SceRtc_stub
+  SceSysmem_stub
+  SceKernelThreadMgr_stub
+  SceKernelModulemgr_stub
+  SceProcessmgr_stub
+  SceLibKernel_stub
   freetype
   bz2
   png16
@@ -70,7 +86,12 @@ vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   VERSION ${VITA_VERSION}
   NAME ${VITA_APP_NAME}
+  FILE ${CMAKE_CURRENT_SOURCE_DIR}/README.md README.md
+  FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/vagaroute-logo.png sce_sys/icon0.png
+  FILE ${CMAKE_CURRENT_SOURCE_DIR}/fondo.png sce_sys/livearea/contents/bg.png
   FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/vagaroute-logo.svg assets/vagaroute-logo.svg
   FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/vagaroute-logo.png assets/vagaroute-logo.png
   FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/Manrope.ttf assets/Manrope.ttf
+  FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/cacert.pem assets/cacert.pem
+  FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/OFL-Manrope.txt assets/OFL-Manrope.txt
 )
