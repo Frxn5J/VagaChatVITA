@@ -1,4 +1,5 @@
 #include "chat.h"
+#include "i18n.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -23,6 +24,8 @@
 #define CHAT_HISTORY_HEADER_SIZE 28U
 #define CHAT_HISTORY_BUFFER_SIZE 180000U
 #define CHAT_REQUEST_BUFFER_SIZE 65536U
+#define CHAT_SYSTEM_PROMPT_SIZE 2048U
+#define CHAT_SUGGESTION_RESPONSE_SIZE 16384U
 #define CHAT_SSE_LINE_SIZE 16384U
 #define CHAT_SSE_EVENT_SIZE 16384U
 #define CHAT_STATUS_SIZE 96U
@@ -59,6 +62,8 @@ typedef struct ChatWorker {
 	char model[CHAT_MAX_MODEL_BYTES + 1];
 	char url[CHAT_MAX_ENDPOINT_BYTES + 32];
 	char authorization[CHAT_MAX_API_KEY_BYTES + 24];
+	char system_prompt[CHAT_SYSTEM_PROMPT_SIZE];
+	char context_prompt[CHAT_SYSTEM_PROMPT_SIZE];
 	char request[CHAT_REQUEST_BUFFER_SIZE];
 	int conversation_index;
 	int assistant_index;
@@ -67,6 +72,17 @@ typedef struct ChatWorker {
 	int finished;
 	ChatSseParser sse;
 } ChatWorker;
+
+typedef struct ChatSuggestionWorker {
+	AppLanguage language;
+	char url[CHAT_MAX_ENDPOINT_BYTES + 32];
+	char authorization[CHAT_MAX_API_KEY_BYTES + 24];
+	char request[CHAT_REQUEST_BUFFER_SIZE];
+	char response[CHAT_SUGGESTION_RESPONSE_SIZE];
+	size_t response_length;
+	int cancel_requested;
+	int finished;
+} ChatSuggestionWorker;
 
 typedef struct JsonCursor {
 	const char *current;
@@ -77,8 +93,10 @@ static const unsigned char chat_history_magic[8] = { 'V', 'C', 'H', 'A', 'T', '1
 static ChatConversation chat_conversations[CHAT_MAX_CONVERSATIONS];
 static unsigned char chat_history_buffer[CHAT_HISTORY_BUFFER_SIZE];
 static ChatWorker chat_worker;
+static ChatSuggestionWorker suggestion_worker;
 static SceUID chat_mutex = -1;
 static SceUID chat_thread = -1;
+static SceUID suggestion_thread = -1;
 static int chat_initialized;
 static int chat_conversation_total;
 static int chat_active_index = -1;
@@ -86,6 +104,9 @@ static ChatRequestState chat_state = CHAT_REQUEST_IDLE;
 static long chat_http_status;
 static char chat_status[CHAT_STATUS_SIZE];
 static char chat_error[CHAT_ERROR_SIZE];
+static ChatSuggestionState suggestion_state = CHAT_SUGGESTIONS_IDLE;
+static char suggestions[CHAT_SUGGESTION_COUNT][CHAT_SUGGESTION_MAX_BYTES + 1];
+static char suggestion_error[CHAT_ERROR_SIZE];
 static SceUID chat_log_file = -1;
 
 static size_t utf8_prefix(const char *text, size_t length, size_t maximum);
@@ -540,6 +561,13 @@ static int build_request_locked(void) {
 	size_t model_length = strlen(chat_worker.model);
 	size_t base = strlen("{\"model\":,\"stream\":true,\"messages\":[]}") +
 		json_escaped_length(chat_worker.model, model_length) + 2;
+	const char *system_prompts[] = { chat_worker.system_prompt, chat_worker.context_prompt };
+	for (size_t prompt_index = 0; prompt_index < sizeof(system_prompts) / sizeof(system_prompts[0]); ++prompt_index) {
+		if (system_prompts[prompt_index][0] != '\0') {
+			base += strlen("{\"role\":\"system\",\"content\":}") +
+				json_escaped_length(system_prompts[prompt_index], strlen(system_prompts[prompt_index])) + 3;
+		}
+	}
 	int first = conversation->message_count;
 	for (int index = conversation->message_count - 1; index >= 0; --index) {
 		ChatMessage *message = &conversation->messages[index];
@@ -574,6 +602,18 @@ static int build_request_locked(void) {
 		return 0;
 	}
 	int written = 0;
+	for (size_t prompt_index = 0; prompt_index < sizeof(system_prompts) / sizeof(system_prompts[0]); ++prompt_index) {
+		const char *prompt = system_prompts[prompt_index];
+		if (prompt[0] == '\0') continue;
+		if ((written && !append_bytes(chat_worker.request, sizeof(chat_worker.request), &length, ",", 1)) ||
+			!append_bytes(chat_worker.request, sizeof(chat_worker.request), &length,
+				"{\"role\":\"system\",\"content\":", sizeof("{\"role\":\"system\",\"content\":") - 1) ||
+			!append_json_string(chat_worker.request, sizeof(chat_worker.request), &length, prompt, strlen(prompt)) ||
+			!append_bytes(chat_worker.request, sizeof(chat_worker.request), &length, "}", 1)) {
+			return 0;
+		}
+		written = 1;
+	}
 	for (int index = first; index < conversation->message_count; ++index) {
 		ChatMessage *message = &conversation->messages[index];
 		if (message->role == CHAT_ROLE_ASSISTANT && message->length == 0) {
@@ -858,6 +898,75 @@ static int extract_delta_content(const char *json, size_t json_length, char *out
 	return decode_json_string(content.current, content.end, output, capacity, output_length, truncated) ? 1 : -1;
 }
 
+static int extract_message_content(const char *json, size_t json_length, char *output,
+	size_t capacity, size_t *output_length, int *truncated) {
+	const char *choices_start;
+	const char *choices_end;
+	const char *message_start;
+	const char *message_end;
+	const char *content_start;
+	const char *content_end;
+	int found = json_find_member(json, json + json_length, "choices", &choices_start, &choices_end);
+	if (found <= 0) return found;
+	JsonCursor choices = { choices_start, choices_end };
+	json_skip_space(&choices);
+	if (choices.current >= choices.end || *choices.current++ != '[') return -1;
+	json_skip_space(&choices);
+	if (choices.current >= choices.end || *choices.current == ']') return 0;
+	const char *first_start = choices.current;
+	if (!json_skip_value(&choices, 1)) return -1;
+	found = json_find_member(first_start, choices.current, "message", &message_start, &message_end);
+	if (found <= 0) return found;
+	found = json_find_member(message_start, message_end, "content", &content_start, &content_end);
+	if (found <= 0) return found;
+	JsonCursor content = { content_start, content_end };
+	json_skip_space(&content);
+	return decode_json_string(content.current, content.end, output, capacity, output_length, truncated) ? 1 : -1;
+}
+
+static int parse_suggestion_json(const char *content, size_t content_length,
+	char output[CHAT_SUGGESTION_COUNT][CHAT_SUGGESTION_MAX_BYTES + 1]) {
+	const char *start = memchr(content, '{', content_length);
+	const char *end = start == NULL ? NULL : strrchr(start, '}');
+	const char *array_start = NULL;
+	const char *array_end = NULL;
+	if (start != NULL && end != NULL) {
+		int found = json_find_member(start, end + 1, "suggestions", &array_start, &array_end);
+		if (found <= 0) return -1;
+	} else {
+		start = memchr(content, '[', content_length);
+		end = start == NULL ? NULL : strrchr(start, ']');
+		if (start == NULL || end == NULL) return -1;
+		array_start = start;
+		array_end = end + 1;
+	}
+
+	JsonCursor array = { array_start, array_end };
+	json_skip_space(&array);
+	if (array.current >= array.end || *array.current++ != '[') return -1;
+	int count = 0;
+	while (count < CHAT_SUGGESTION_COUNT) {
+		json_skip_space(&array);
+		if (array.current >= array.end || *array.current == ']') break;
+		const char *item_start = array.current;
+		if (!json_skip_value(&array, 1)) return -1;
+		const char *item_end = array.current;
+		size_t output_length = 0;
+		int truncated = 0;
+		if (!decode_json_string(item_start, item_end, output[count],
+			sizeof(output[count]), &output_length, &truncated) || truncated || output_length == 0) {
+			return -1;
+		}
+		++count;
+		json_skip_space(&array);
+		if (array.current < array.end && *array.current == ',') {
+			++array.current;
+		}
+	}
+	json_skip_space(&array);
+	return count == CHAT_SUGGESTION_COUNT && array.current < array.end && *array.current == ']' ? 0 : -1;
+}
+
 static int append_assistant_content(const char *text, size_t length) {
 	int appended = 0;
 	chat_lock();
@@ -993,6 +1102,141 @@ static const char *curl_error_message(CURLcode code) {
 	if (code == CURLE_SEND_ERROR || code == CURLE_RECV_ERROR) return "Se interrumpio la conexion.";
 	if (code == CURLE_OUT_OF_MEMORY) return "Memoria insuficiente para la solicitud.";
 	return "Error de red.";
+}
+
+static size_t write_suggestion_response(char *data, size_t size, size_t count, void *user_data) {
+	ChatSuggestionWorker *worker = user_data;
+	size_t bytes = size * count;
+	if (bytes > sizeof(worker->response) - worker->response_length - 1) {
+		return 0;
+	}
+	memcpy(worker->response + worker->response_length, data, bytes);
+	worker->response_length += bytes;
+	worker->response[worker->response_length] = '\0';
+	return bytes;
+}
+
+static int suggestion_transfer_progress(void *user_data, curl_off_t download_total,
+	curl_off_t download_now, curl_off_t upload_total, curl_off_t upload_now) {
+	ChatSuggestionWorker *worker = user_data;
+	(void)download_total;
+	(void)download_now;
+	(void)upload_total;
+	(void)upload_now;
+	chat_lock();
+	int cancelled = worker->cancel_requested;
+	chat_unlock();
+	return cancelled ? 1 : 0;
+}
+
+static int build_suggestion_request(ChatSuggestionWorker *worker, const char *model,
+	const char *title, const char *title_id) {
+	const char *system_prompt = i18n_suggestions_system_prompt(worker->language);
+	char user_prompt[512];
+	int user_prompt_length = i18n_suggestions_user_prompt(worker->language, title, title_id,
+		user_prompt, sizeof(user_prompt));
+	if (user_prompt_length < 0 || user_prompt_length >= (int)sizeof(user_prompt)) return 0;
+	size_t length = 0;
+	if (!append_bytes(worker->request, sizeof(worker->request), &length, "{\"model\":", 9) ||
+		!append_json_string(worker->request, sizeof(worker->request), &length, model, strlen(model)) ||
+		!append_bytes(worker->request, sizeof(worker->request), &length,
+			",\"stream\":false,\"messages\":[{\"role\":\"system\",\"content\":",
+			sizeof(",\"stream\":false,\"messages\":[{\"role\":\"system\",\"content\":") - 1) ||
+		!append_json_string(worker->request, sizeof(worker->request), &length,
+			system_prompt, strlen(system_prompt)) ||
+		!append_bytes(worker->request, sizeof(worker->request), &length,
+			"},{\"role\":\"user\",\"content\":", sizeof("},{\"role\":\"user\",\"content\":") - 1) ||
+		!append_json_string(worker->request, sizeof(worker->request), &length,
+			user_prompt, (size_t)user_prompt_length) ||
+		!append_bytes(worker->request, sizeof(worker->request), &length, "}]}", 3)) {
+		return 0;
+	}
+	return 1;
+}
+
+static int suggestion_worker_entry(SceSize arguments, void *argument) {
+	CURL *curl = NULL;
+	struct curl_slist *headers = NULL;
+	CURLcode result = CURLE_FAILED_INIT;
+	long status_code = 0;
+	char parsed[CHAT_SUGGESTION_COUNT][CHAT_SUGGESTION_MAX_BYTES + 1] = { 0 };
+	char content[CHAT_SUGGESTION_RESPONSE_SIZE] = { 0 };
+	int parsed_ok = 0;
+	(void)arguments;
+	(void)argument;
+
+	curl = curl_easy_init();
+	if (curl != NULL) {
+		headers = curl_slist_append(headers, "Accept: application/json");
+		struct curl_slist *updated_headers = headers == NULL ? NULL :
+			curl_slist_append(headers, "Content-Type: application/json");
+		if (updated_headers != NULL) headers = updated_headers;
+		if (headers != NULL && suggestion_worker.authorization[0] != '\0') {
+			updated_headers = curl_slist_append(headers, suggestion_worker.authorization);
+			if (updated_headers != NULL) headers = updated_headers;
+			else headers = NULL;
+		}
+		if (headers != NULL) {
+			curl_easy_setopt(curl, CURLOPT_URL, suggestion_worker.url);
+			curl_easy_setopt(curl, CURLOPT_POST, 1L);
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, suggestion_worker.request);
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(suggestion_worker.request));
+			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+			curl_easy_setopt(curl, CURLOPT_USERAGENT, "VagaChatVITA/1.1");
+			curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+			curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
+			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+			curl_easy_setopt(curl, CURLOPT_CAINFO, CHAT_CA_FILE);
+			curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+			curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L);
+			curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+			curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_suggestion_response);
+			curl_easy_setopt(curl, CURLOPT_WRITEDATA, &suggestion_worker);
+			curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, suggestion_transfer_progress);
+			curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &suggestion_worker);
+			curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+			result = curl_easy_perform(curl);
+			curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+		}
+	}
+
+	if (result == CURLE_OK && status_code >= 200 && status_code < 300) {
+		size_t content_length = 0;
+		int truncated = 0;
+		int extracted = extract_message_content(suggestion_worker.response, suggestion_worker.response_length,
+			content, sizeof(content), &content_length, &truncated);
+		if (extracted > 0 && !truncated) {
+			parsed_ok = parse_suggestion_json(content, content_length, parsed) == 0;
+		}
+	}
+
+	chat_lock();
+	if (suggestion_worker.cancel_requested || result == CURLE_ABORTED_BY_CALLBACK) {
+		suggestion_state = CHAT_SUGGESTIONS_CANCELLED;
+		suggestion_error[0] = '\0';
+	} else if (parsed_ok) {
+		memcpy(suggestions, parsed, sizeof(suggestions));
+		suggestion_state = CHAT_SUGGESTIONS_READY;
+		suggestion_error[0] = '\0';
+	} else {
+		suggestion_state = CHAT_SUGGESTIONS_ERROR;
+		if (status_code >= 400) {
+			copy_text(suggestion_error, sizeof(suggestion_error), "La API rechazo las sugerencias.");
+		} else if (result != CURLE_OK) {
+			copy_text(suggestion_error, sizeof(suggestion_error), curl_error_message(result));
+		} else {
+			copy_text(suggestion_error, sizeof(suggestion_error), "La respuesta de sugerencias no es valida.");
+		}
+	}
+	suggestion_worker.finished = 1;
+	chat_log_locked("SUGGESTIONS_END state=%d http=%ld curl=%d parsed=%d",
+		(int)suggestion_state, status_code, result, parsed_ok);
+	chat_unlock();
+
+	if (headers != NULL) curl_slist_free_all(headers);
+	if (curl != NULL) curl_easy_cleanup(curl);
+	return 0;
 }
 
 static int chat_worker_entry(SceSize arguments, void *argument) {
@@ -1146,7 +1390,13 @@ int chat_init(void) {
 	chat_conversation_total = 0;
 	chat_active_index = -1;
 	chat_thread = -1;
+	suggestion_thread = -1;
 	chat_state = CHAT_REQUEST_IDLE;
+	suggestion_state = CHAT_SUGGESTIONS_IDLE;
+	memset(&suggestion_worker, 0, sizeof(suggestion_worker));
+	suggestion_worker.language = i18n_get_language();
+	memset(suggestions, 0, sizeof(suggestions));
+	suggestion_error[0] = '\0';
 	chat_http_status = 0;
 	chat_status[0] = '\0';
 	chat_error[0] = '\0';
@@ -1166,7 +1416,16 @@ int chat_init(void) {
 
 void chat_shutdown(void) {
 	if (!chat_initialized) return;
+	chat_cancel_suggestions();
 	chat_cancel();
+	SceUID suggestion_to_wait;
+	chat_lock();
+	suggestion_to_wait = suggestion_thread;
+	chat_unlock();
+	if (suggestion_to_wait >= 0) {
+		sceKernelWaitThreadEnd(suggestion_to_wait, NULL, NULL);
+		sceKernelDeleteThread(suggestion_to_wait);
+	}
 	SceUID thread;
 	chat_lock();
 	thread = chat_thread;
@@ -1176,6 +1435,7 @@ void chat_shutdown(void) {
 		sceKernelDeleteThread(thread);
 	}
 	chat_lock();
+	suggestion_thread = -1;
 	chat_thread = -1;
 	size_t history_length = serialize_history_locked();
 	chat_unlock();
@@ -1197,10 +1457,15 @@ void chat_shutdown(void) {
 void chat_update(void) {
 	if (!chat_initialized) return;
 	SceUID finished_thread = -1;
+	SceUID finished_suggestion = -1;
 	chat_lock();
 	if (chat_thread >= 0 && chat_worker.finished) {
 		finished_thread = chat_thread;
 		chat_thread = -1;
+	}
+	if (suggestion_thread >= 0 && suggestion_worker.finished) {
+		finished_suggestion = suggestion_thread;
+		suggestion_thread = -1;
 	}
 	chat_unlock();
 	if (finished_thread >= 0) {
@@ -1210,6 +1475,16 @@ void chat_update(void) {
 		} else {
 			chat_lock();
 			if (chat_thread < 0) chat_thread = finished_thread;
+			chat_unlock();
+		}
+	}
+	if (finished_suggestion >= 0) {
+		SceUInt timeout = 0;
+		if (sceKernelWaitThreadEnd(finished_suggestion, NULL, &timeout) >= 0) {
+			sceKernelDeleteThread(finished_suggestion);
+		} else {
+			chat_lock();
+			if (suggestion_thread < 0) suggestion_thread = finished_suggestion;
 			chat_unlock();
 		}
 	}
@@ -1359,16 +1634,20 @@ static int has_url_unsafe_character(const char *text, size_t length) {
 	return 0;
 }
 
-int chat_send(const char *endpoint, const char *api_key, const char *model, const char *message) {
+int chat_send(const char *endpoint, const char *api_key, const char *model, const char *message,
+	const char *system_prompt, const char *context_prompt) {
 	if (!chat_initialized) return CHAT_ERR_NOT_INITIALIZED;
 	size_t endpoint_length = bounded_length(endpoint, CHAT_MAX_ENDPOINT_BYTES);
 	size_t key_length = bounded_length(api_key, CHAT_MAX_API_KEY_BYTES);
 	size_t model_length = bounded_length(model, CHAT_MAX_MODEL_BYTES);
 	size_t message_length = bounded_length(message, CHAT_MAX_MESSAGE_BYTES);
+	size_t system_length = bounded_length(system_prompt, CHAT_SYSTEM_PROMPT_SIZE - 1);
+	size_t context_length = bounded_length(context_prompt, CHAT_SYSTEM_PROMPT_SIZE - 1);
 	if (endpoint == NULL || strncmp(endpoint, "https://", 8) != 0 ||
 		endpoint_length <= 8 || endpoint_length > CHAT_MAX_ENDPOINT_BYTES || endpoint[8] == '/' ||
 		model == NULL || model_length == 0 || model_length > CHAT_MAX_MODEL_BYTES ||
 		message == NULL || message_length == 0 || message_length > CHAT_MAX_MESSAGE_BYTES ||
+		system_length > CHAT_SYSTEM_PROMPT_SIZE - 1 || context_length > CHAT_SYSTEM_PROMPT_SIZE - 1 ||
 		(api_key != NULL && key_length > CHAT_MAX_API_KEY_BYTES) ||
 		!utf8_validate(model, model_length) || !utf8_validate(message, message_length) ||
 		has_url_unsafe_character(endpoint, endpoint_length) ||
@@ -1412,6 +1691,10 @@ int chat_send(const char *endpoint, const char *api_key, const char *model, cons
 	chat_worker.api_key[key_length] = '\0';
 	memcpy(chat_worker.model, model, model_length);
 	chat_worker.model[model_length] = '\0';
+	if (system_prompt != NULL && system_length > 0) memcpy(chat_worker.system_prompt, system_prompt, system_length);
+	chat_worker.system_prompt[system_length] = '\0';
+	if (context_prompt != NULL && context_length > 0) memcpy(chat_worker.context_prompt, context_prompt, context_length);
+	chat_worker.context_prompt[context_length] = '\0';
 	memcpy(chat_worker.url, endpoint, endpoint_length);
 	memcpy(chat_worker.url + endpoint_length, suffix, sizeof(suffix));
 	if (key_length > 0) {
@@ -1461,6 +1744,113 @@ int chat_send(const char *endpoint, const char *api_key, const char *model, cons
 		write_history_file(history_length);
 		return CHAT_ERR_THREAD;
 	}
+	return CHAT_OK;
+}
+
+int chat_request_suggestions(const char *endpoint, const char *api_key, const char *model,
+	const char *title, const char *title_id) {
+	if (!chat_initialized) return CHAT_ERR_NOT_INITIALIZED;
+	size_t endpoint_length = bounded_length(endpoint, CHAT_MAX_ENDPOINT_BYTES);
+	size_t key_length = bounded_length(api_key, CHAT_MAX_API_KEY_BYTES);
+	size_t model_length = bounded_length(model, CHAT_MAX_MODEL_BYTES);
+	size_t title_length = bounded_length(title, CHAT_SUGGESTION_MAX_BYTES);
+	size_t title_id_length = bounded_length(title_id, 63);
+	if (endpoint == NULL || strncmp(endpoint, "https://", 8) != 0 || endpoint_length <= 8 ||
+		endpoint_length > CHAT_MAX_ENDPOINT_BYTES || endpoint[8] == '/' || model == NULL ||
+		model_length == 0 || model_length > CHAT_MAX_MODEL_BYTES || title == NULL ||
+		title_length == 0 || title_length > CHAT_SUGGESTION_MAX_BYTES || title_id == NULL ||
+		title_id_length == 0 || title_id_length > 63 || has_url_unsafe_character(endpoint, endpoint_length) ||
+		!utf8_validate(model, model_length) || !utf8_validate(title, title_length) ||
+		(api_key != NULL && key_length > CHAT_MAX_API_KEY_BYTES) ||
+		(api_key != NULL && has_header_control(api_key, key_length))) {
+		return CHAT_ERR_INVALID;
+	}
+	while (endpoint_length > 8 && endpoint[endpoint_length - 1] == '/') --endpoint_length;
+	static const char suffix[] = "/chat/completions";
+	if (endpoint_length + sizeof(suffix) > sizeof(suggestion_worker.url)) return CHAT_ERR_INVALID;
+	chat_update();
+	chat_lock();
+	if (suggestion_thread >= 0 || request_is_active() || chat_thread >= 0) {
+		chat_unlock();
+		return CHAT_ERR_BUSY;
+	}
+	memset(&suggestion_worker, 0, sizeof(suggestion_worker));
+	suggestion_worker.language = i18n_get_language();
+	memcpy(suggestion_worker.url, endpoint, endpoint_length);
+	memcpy(suggestion_worker.url + endpoint_length, suffix, sizeof(suffix));
+	if (key_length > 0) {
+		static const char prefix[] = "Authorization: Bearer ";
+		memcpy(suggestion_worker.authorization, prefix, sizeof(prefix) - 1);
+		memcpy(suggestion_worker.authorization + sizeof(prefix) - 1, api_key, key_length);
+		suggestion_worker.authorization[sizeof(prefix) - 1 + key_length] = '\0';
+	}
+	if (!build_suggestion_request(&suggestion_worker, model, title, title_id)) {
+		chat_unlock();
+		return CHAT_ERR_INVALID;
+	}
+	suggestion_state = CHAT_SUGGESTIONS_LOADING;
+	suggestion_error[0] = '\0';
+	chat_log_locked("SUGGESTIONS_START model=%s title_id=%s", model, title_id);
+	suggestion_thread = sceKernelCreateThread("VagaSuggestionWorker", suggestion_worker_entry,
+		CHAT_THREAD_PRIORITY, CHAT_THREAD_STACK_SIZE, 0,
+		SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, NULL);
+	SceUID thread = suggestion_thread;
+	chat_unlock();
+	if (thread < 0) {
+		chat_lock();
+		suggestion_state = CHAT_SUGGESTIONS_ERROR;
+		copy_text(suggestion_error, sizeof(suggestion_error), "No se pudo crear el hilo de sugerencias.");
+		suggestion_thread = -1;
+		chat_unlock();
+		return CHAT_ERR_THREAD;
+	}
+	if (sceKernelStartThread(thread, 0, NULL) < 0) {
+		sceKernelDeleteThread(thread);
+		chat_lock();
+		suggestion_state = CHAT_SUGGESTIONS_ERROR;
+		copy_text(suggestion_error, sizeof(suggestion_error), "No se pudo iniciar el hilo de sugerencias.");
+		suggestion_thread = -1;
+		chat_unlock();
+		return CHAT_ERR_THREAD;
+	}
+	return CHAT_OK;
+}
+
+ChatSuggestionState chat_suggestion_state(void) {
+	if (!chat_initialized) return CHAT_SUGGESTIONS_IDLE;
+	chat_lock();
+	ChatSuggestionState state = suggestion_state;
+	chat_unlock();
+	return state;
+}
+
+int chat_copy_suggestion(int index, char *output, size_t capacity) {
+	if (!chat_initialized) return CHAT_ERR_NOT_INITIALIZED;
+	if (index < 0 || index >= CHAT_SUGGESTION_COUNT) return CHAT_ERR_RANGE;
+	chat_lock();
+	int result = copy_out(suggestions[index], output, capacity);
+	chat_unlock();
+	return result;
+}
+
+int chat_copy_suggestion_error(char *output, size_t capacity) {
+	if (!chat_initialized) return CHAT_ERR_NOT_INITIALIZED;
+	chat_lock();
+	int result = copy_out(suggestion_error, output, capacity);
+	chat_unlock();
+	return result;
+}
+
+int chat_cancel_suggestions(void) {
+	if (!chat_initialized) return CHAT_ERR_NOT_INITIALIZED;
+	chat_lock();
+	if (suggestion_state != CHAT_SUGGESTIONS_LOADING || suggestion_worker.finished) {
+		chat_unlock();
+		return CHAT_ERR_INVALID;
+	}
+	suggestion_worker.cancel_requested = 1;
+	suggestion_state = CHAT_SUGGESTIONS_CANCELLED;
+	chat_unlock();
 	return CHAT_OK;
 }
 

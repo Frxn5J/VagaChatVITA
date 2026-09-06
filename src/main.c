@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -7,6 +8,7 @@
 
 #include <psp2/ctrl.h>
 #include <psp2/ime_dialog.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
@@ -19,6 +21,8 @@
 #include <vita2d.h>
 
 #include "chat.h"
+#include "i18n.h"
+#include "web_config.h"
 
 #define SCREEN_WIDTH 960
 #define SCREEN_HEIGHT 544
@@ -42,6 +46,9 @@
 #define CONFIG_BUFFER_CAPACITY 4096
 #define NETWORK_MEMORY_SIZE (1024 * 1024)
 #define CA_CERTIFICATE_FILE "app0:assets/cacert.pem"
+#define LIBRARY_MAX_TITLES 64
+#define LIBRARY_TITLE_BYTES 127
+#define LIBRARY_PAGE_SIZE 8
 
 #define KEYBOARD_ROWS 7
 #define KEYBOARD_COLUMNS 6
@@ -78,10 +85,14 @@ static vita2d_texture *app_logo;
 static char user_name[NAME_CAPACITY + 1];
 static char endpoint_url[ENDPOINT_CAPACITY + 1];
 static char api_key[API_KEY_CAPACITY + 1];
+static unsigned char web_password_hash[WEB_CONFIG_PASSWORD_HASH_BYTES];
+static int web_password_configured;
 static char models[MODEL_COUNT][MODEL_CAPACITY + 1];
 static char selected_model[MODEL_CAPACITY + 1];
 static int model_count;
 static int config_needs_rewrite;
+static AppLanguage app_language = APP_LANGUAGE_SPANISH;
+static int language_configured;
 static char message_text[MESSAGE_CAPACITY + 1];
 static char status_message[64];
 static int status_is_error;
@@ -92,14 +103,21 @@ static int keyboard_row;
 static int keyboard_column;
 static int keyboard_target;
 static int chat_focus;
-static int input_mode;
+static int quick_prompt_selection = -1;
 static int history_modal;
 static int history_selection;
+static int library_modal;
+static int library_selection;
+static int library_page;
+static int game_context;
+static char game_title[LIBRARY_TITLE_BYTES + 1];
+static char game_title_id[16];
+static vita2d_texture *game_logo;
+static unsigned int landing_animation;
 static int chat_scroll_offset;
 static int chat_scroll_max;
 static int chat_follow_bottom = 1;
 static int chat_analog_delay;
-static int info_modal;
 static int side_menu_open;
 static int side_menu_selection;
 static int model_selector_open;
@@ -122,10 +140,20 @@ static int ime_origin_screen;
 static int ime_module_loaded;
 static int settings_focus;
 
+typedef struct LibraryTitle {
+	char title_id[16];
+	char title[LIBRARY_TITLE_BYTES + 1];
+	vita2d_texture *icon;
+} LibraryTitle;
+
+static LibraryTitle library_titles[LIBRARY_MAX_TITLES];
+static int library_count;
+
 enum {
 	SCREEN_NAME,
 	SCREEN_CHAT,
-	SCREEN_SETTINGS
+	SCREEN_SETTINGS,
+	SCREEN_WEB_CONFIG
 };
 
 enum {
@@ -143,6 +171,8 @@ enum {
 
 static void send_message(void);
 static void draw_menu_icon(float x, float y, uint32_t color);
+static void open_web_config(void);
+static void update_web_config(void);
 
 static void set_status(const char *message, int is_error) {
 	strncpy(status_message, message, sizeof(status_message) - 1);
@@ -171,11 +201,11 @@ static unsigned int text_size(float scale) {
 }
 
 static int text_width(float scale, const char *text) {
-	return vita2d_font_text_width(ui_font, text_size(scale), text);
+	return vita2d_font_text_width(ui_font, text_size(scale), i18n_translate(text));
 }
 
 static void draw_text(float x, float baseline, float scale, uint32_t color, const char *text) {
-	vita2d_font_draw_text(ui_font, (int)x, (int)baseline, color, text_size(scale), text);
+	vita2d_font_draw_text(ui_font, (int)x, (int)baseline, color, text_size(scale), i18n_translate(text));
 }
 
 static void draw_text_centered(float x, float baseline, float width, float scale, uint32_t color, const char *text) {
@@ -184,11 +214,11 @@ static void draw_text_centered(float x, float baseline, float width, float scale
 }
 
 static void draw_text_fit(float x, float baseline, float width, float scale, uint32_t color, const char *text) {
-	const char *visible = text;
+	const char *visible = i18n_translate(text);
 	while (*visible != '\0' && text_width(scale, visible) > width) {
 		++visible;
 	}
-	draw_text(x, baseline, scale, color, visible);
+	vita2d_font_draw_text(ui_font, (int)x, (int)baseline, color, text_size(scale), visible);
 }
 
 static void draw_round_rect(float x, float y, float width, float height, float radius, uint32_t color) {
@@ -276,6 +306,116 @@ static void copy_config_value(char *target, int capacity, const char *value) {
 	target[length] = '\0';
 }
 
+static uint16_t library_read_u16(const unsigned char *data) {
+	return (uint16_t)data[0] | (uint16_t)data[1] << 8;
+}
+
+static uint32_t library_read_u32(const unsigned char *data) {
+	return (uint32_t)data[0] | (uint32_t)data[1] << 8 |
+		(uint32_t)data[2] << 16 | (uint32_t)data[3] << 24;
+}
+
+static void library_copy_text(char *target, size_t capacity, const char *source) {
+	if (capacity == 0) return;
+	size_t length = strlen(source);
+	if (length >= capacity) length = capacity - 1;
+	memcpy(target, source, length);
+	target[length] = '\0';
+}
+
+static int library_read_title(const char *path, char *title, int capacity) {
+	static unsigned char buffer[16384];
+	SceUID file = sceIoOpen(path, SCE_O_RDONLY, 0);
+	if (file < 0) {
+		return -1;
+	}
+	int length = sceIoRead(file, buffer, sizeof(buffer));
+	sceIoClose(file);
+	if (length < 20 || buffer[0] != '\0' || buffer[1] != 'P' || buffer[2] != 'S' || buffer[3] != 'F') {
+		return -1;
+	}
+
+	uint32_t key_offset = library_read_u32(buffer + 8);
+	uint32_t data_offset = library_read_u32(buffer + 12);
+	uint32_t entry_count = library_read_u32(buffer + 16);
+	if (key_offset >= (uint32_t)length || data_offset >= (uint32_t)length || entry_count > 512 ||
+		20U + entry_count * 16U > (uint32_t)length) {
+		return -1;
+	}
+
+	title[0] = '\0';
+	for (uint32_t index = 0; index < entry_count; ++index) {
+		const unsigned char *entry = buffer + 20 + index * 16;
+		uint32_t key_position = key_offset + library_read_u16(entry);
+		uint32_t value_position = data_offset + library_read_u32(entry + 12);
+		uint32_t value_size = library_read_u32(entry + 4);
+		if (key_position >= (uint32_t)length || value_position >= (uint32_t)length ||
+			value_size > (uint32_t)length - value_position ||
+			strcmp((const char *)buffer + key_position, "TITLE") != 0) {
+			continue;
+		}
+		uint32_t copy_length = value_size;
+		if (copy_length > 0 && buffer[value_position + copy_length - 1] == '\0') {
+			--copy_length;
+		}
+		if (copy_length >= (uint32_t)capacity) {
+			copy_length = (uint32_t)capacity - 1;
+		}
+		memcpy(title, buffer + value_position, copy_length);
+		title[copy_length] = '\0';
+		return title[0] != '\0' ? 0 : -1;
+	}
+	return -1;
+}
+
+static void library_free(void) {
+	for (int index = 0; index < library_count; ++index) {
+		if (library_titles[index].icon != NULL) {
+			vita2d_free_texture(library_titles[index].icon);
+			library_titles[index].icon = NULL;
+		}
+	}
+	library_count = 0;
+}
+
+static void library_scan(void) {
+	library_free();
+	SceUID directory = sceIoDopen("ux0:app");
+	if (directory < 0) {
+		return;
+	}
+
+	SceIoDirent entry;
+	while (library_count < LIBRARY_MAX_TITLES && sceIoDread(directory, &entry) > 0) {
+		if ((!SCE_S_ISDIR(entry.d_stat.st_mode) && !SCE_SO_ISDIR(entry.d_stat.st_attr)) ||
+			entry.d_name[0] == '.' || entry.d_name[0] == '\0') {
+			continue;
+		}
+		char param_path[320];
+		snprintf(param_path, sizeof(param_path), "ux0:app/%s/sce_sys/param.sfo", entry.d_name);
+		LibraryTitle *title = &library_titles[library_count];
+		library_copy_text(title->title_id, sizeof(title->title_id), entry.d_name);
+		if (library_read_title(param_path, title->title, sizeof(title->title)) < 0) {
+			library_copy_text(title->title, sizeof(title->title), title->title_id);
+		}
+		char icon_path[320];
+		snprintf(icon_path, sizeof(icon_path), "ux0:app/%s/sce_sys/icon0.png", entry.d_name);
+		title->icon = vita2d_load_PNG_file(icon_path);
+		++library_count;
+	}
+	sceIoDclose(directory);
+
+	for (int left = 0; left < library_count; ++left) {
+		for (int right = left + 1; right < library_count; ++right) {
+			if (strcmp(library_titles[left].title, library_titles[right].title) > 0) {
+				LibraryTitle swap = library_titles[left];
+				library_titles[left] = library_titles[right];
+				library_titles[right] = swap;
+			}
+		}
+	}
+}
+
 static int hex_value(char character) {
 	if (character >= '0' && character <= '9') {
 		return character - '0';
@@ -305,6 +445,32 @@ static void decode_api_key(const char *encoded) {
 	api_key[length] = '\0';
 }
 
+static void encode_api_key(char *encoded, int capacity) {
+	static const char mask[] = "VagaRouteAI";
+	static const char digits[] = "0123456789abcdef";
+	int length = 0;
+	for (int index = 0; api_key[index] != '\0' && length + 2 < capacity; ++index) {
+		unsigned char value = (unsigned char)api_key[index] ^ (unsigned char)mask[index % (sizeof(mask) - 1)];
+		encoded[length++] = digits[value >> 4];
+		encoded[length++] = digits[value & 15];
+	}
+	encoded[length] = '\0';
+}
+
+static int decode_web_password_hash(const char *encoded) {
+	for (int index = 0; index < WEB_CONFIG_PASSWORD_HASH_BYTES; ++index) {
+		int high = hex_value(encoded[index * 2]);
+		int low = hex_value(encoded[index * 2 + 1]);
+		if (high < 0 || low < 0) return -1;
+		web_password_hash[index] = (unsigned char)((high << 4) | low);
+	}
+	if (encoded[WEB_CONFIG_PASSWORD_HASH_BYTES * 2] != '\0' &&
+		encoded[WEB_CONFIG_PASSWORD_HASH_BYTES * 2] != '\r' &&
+		encoded[WEB_CONFIG_PASSWORD_HASH_BYTES * 2] != '\n') return -1;
+	web_password_configured = 1;
+	return 0;
+}
+
 static void append_config_text(char *buffer, int *length, const char *text) {
 	while (*text != '\0' && *length < CONFIG_BUFFER_CAPACITY - 1) {
 		buffer[(*length)++] = *text++;
@@ -322,12 +488,31 @@ static void append_config_line(char *buffer, int *length, const char *key, const
 	}
 }
 
+static void append_config_hex_line(char *buffer, int *length, const char *key,
+	const unsigned char *value, int value_length) {
+	static const char digits[] = "0123456789abcdef";
+	append_config_text(buffer, length, key);
+	if (*length < CONFIG_BUFFER_CAPACITY - 1) buffer[(*length)++] = '=';
+	for (int index = 0; index < value_length && *length < CONFIG_BUFFER_CAPACITY - 2; ++index) {
+		buffer[(*length)++] = digits[value[index] >> 4];
+		buffer[(*length)++] = digits[value[index] & 15];
+	}
+	if (*length < CONFIG_BUFFER_CAPACITY - 1) buffer[(*length)++] = '\n';
+}
+
 static int save_config(void) {
 	char buffer[CONFIG_BUFFER_CAPACITY] = { 0 };
 	int length = 0;
 	append_config_line(buffer, &length, "name", user_name);
+	append_config_line(buffer, &length, "language", i18n_language_code(app_language));
 	append_config_line(buffer, &length, "endpoint_url", endpoint_url);
-	append_config_line(buffer, &length, "api_key", api_key);
+	char encoded_api_key[API_KEY_CAPACITY * 2 + 1];
+	encode_api_key(encoded_api_key, sizeof(encoded_api_key));
+	append_config_line(buffer, &length, "api_key_enc", encoded_api_key);
+	if (web_password_configured) {
+		append_config_hex_line(buffer, &length, "web_password_hash", web_password_hash,
+			WEB_CONFIG_PASSWORD_HASH_BYTES);
+	}
 	append_config_line(buffer, &length, "selected_model", selected_model);
 	append_config_text(buffer, &length, "[models]\n");
 	for (int index = 0; index < model_count && index < MODEL_COUNT; ++index) {
@@ -348,6 +533,7 @@ static int save_config(void) {
 	}
 	int written = sceIoWrite(file, buffer, length);
 	sceIoClose(file);
+	language_configured = 1;
 	return written == length ? 0 : -1;
 }
 
@@ -388,14 +574,29 @@ static void load_config(void) {
 			} else {
 				copy_config_value(user_name, sizeof(user_name), line + 5);
 			}
+		} else if (strncmp(line, "language=", 9) == 0) {
+			char code[4] = { 0 };
+			copy_config_value(code, sizeof(code), line + 9);
+			if (strcmp(code, "en") == 0) app_language = APP_LANGUAGE_ENGLISH;
+			else if (strcmp(code, "it") == 0) app_language = APP_LANGUAGE_ITALIAN;
+			else app_language = APP_LANGUAGE_SPANISH;
+			language_configured = 1;
 		} else if (strncmp(line, "endpoint_url=", 13) == 0) {
 			copy_config_value(endpoint_url, sizeof(endpoint_url), line + 13);
 		} else if (strncmp(line, "api_key=", 8) == 0) {
 			copy_config_value(api_key, sizeof(api_key), line + 8);
+			config_needs_rewrite = 1;
 		} else if (strncmp(line, "api_key_enc=", 12) == 0 && api_key[0] == '\0') {
 			char encoded[API_KEY_CAPACITY * 2 + 1] = { 0 };
 			copy_config_value(encoded, sizeof(encoded), line + 12);
 			decode_api_key(encoded);
+		} else if (strncmp(line, "web_password_hash=", 18) == 0) {
+			char encoded[WEB_CONFIG_PASSWORD_HASH_BYTES * 2 + 1] = { 0 };
+			copy_config_value(encoded, sizeof(encoded), line + 18);
+			if (decode_web_password_hash(encoded) < 0) {
+				web_password_configured = 0;
+				memset(web_password_hash, 0, sizeof(web_password_hash));
+			}
 		} else if (strncmp(line, "selected_model=", 15) == 0) {
 			copy_config_value(selected_model, sizeof(selected_model), line + 15);
 		} else if (strncmp(line, "model_", 6) == 0 && model_count < MODEL_COUNT) {
@@ -608,13 +809,19 @@ static void draw_name_interface(void) {
 	draw_text(526.0f, 226.0f, 0.72f, COLOR_MUTED, "NOMBRE");
 	draw_input();
 
-	draw_border_width(526.0f, 286.0f, 350.0f, 38.0f, 7.0f, 2.0f, COLOR_ACCENT, COLOR_ACCENT);
-	draw_text_centered(526.0f, 311.0f, 350.0f, 0.95f, RGBA8(25, 19, 16, 255), user_name[0] == '\0' ? "CONTINUAR" : "GUARDAR CAMBIOS");
+	draw_text(526.0f, 278.0f, 0.72f, COLOR_MUTED, "IDIOMA");
+	uint32_t language_border = focus == 1 && !keyboard_open ? COLOR_ACCENT : COLOR_CARD_EDGE;
+	draw_border_width(526.0f, 286.0f, 350.0f, 38.0f, 7.0f, 2.0f, language_border, COLOR_FIELD);
+	draw_text_centered(526.0f, 311.0f, 350.0f, 0.86f, COLOR_TEXT, i18n_language_name(app_language));
 
-	draw_text(526.0f, 350.0f, 0.72f, COLOR_SUBTLE, "LA CONFIGURACION SE GUARDA SOLO");
-	draw_text(526.0f, 365.0f, 0.72f, COLOR_SUBTLE, "EN UX0:DATA/VAGAROUTEAI.");
+	uint32_t continue_border = focus == 2 && !keyboard_open ? COLOR_TEXT : COLOR_ACCENT;
+	draw_border_width(526.0f, 342.0f, 350.0f, 38.0f, 7.0f, 2.0f, continue_border, COLOR_ACCENT);
+	draw_text_centered(526.0f, 367.0f, 350.0f, 0.95f, RGBA8(25, 19, 16, 255), user_name[0] == '\0' ? "CONTINUAR" : "GUARDAR CAMBIOS");
+
+	draw_text(526.0f, 403.0f, 0.72f, COLOR_SUBTLE, "LA CONFIGURACION SE GUARDA SOLO");
+	draw_text(526.0f, 418.0f, 0.72f, COLOR_SUBTLE, "EN UX0:DATA/VAGAROUTEAI.");
 	if (status_message[0] != '\0') {
-		draw_text(526.0f, 393.0f, 0.72f, status_is_error ? COLOR_ERROR : COLOR_SUCCESS, status_message);
+		draw_text(526.0f, 441.0f, 0.72f, status_is_error ? COLOR_ERROR : COLOR_SUCCESS, status_message);
 	}
 
 	draw_text(526.0f, 468.0f, 0.72f, COLOR_MUTED, "CRUZ: EDITAR   ARRIBA/ABAJO: CAMBIAR");
@@ -673,17 +880,18 @@ static void draw_sidebar_icon(float x, float y, int type, uint32_t color) {
 		draw_icon_stroke(x + 19.0f, y + 2.0f, x + 23.0f, y + 2.0f, color);
 		draw_icon_stroke(x + 23.0f, y + 2.0f, x + 23.0f, y + 6.0f, color);
 	} else if (type == 2) {
-		draw_icon_stroke(x + 3.0f, y + 5.0f, x + 21.0f, y + 5.0f, color);
-		draw_icon_stroke(x + 21.0f, y + 5.0f, x + 23.0f, y + 7.0f, color);
-		draw_icon_stroke(x + 23.0f, y + 7.0f, x + 23.0f, y + 21.0f, color);
-		draw_icon_stroke(x + 23.0f, y + 21.0f, x + 3.0f, y + 21.0f, color);
-		draw_icon_stroke(x + 3.0f, y + 21.0f, x + 3.0f, y + 5.0f, color);
-		vita2d_draw_fill_circle(x + 17.0f, y + 10.0f, 2.0f, color);
-		draw_icon_stroke(x + 5.0f, y + 19.0f, x + 10.0f, y + 13.0f, color);
-		draw_icon_stroke(x + 10.0f, y + 13.0f, x + 15.0f, y + 18.0f, color);
-		draw_icon_stroke(x + 15.0f, y + 18.0f, x + 19.0f, y + 14.0f, color);
-		draw_icon_stroke(x + 25.0f, y + 2.0f, x + 25.0f, y + 8.0f, color);
-		draw_icon_stroke(x + 22.0f, y + 5.0f, x + 28.0f, y + 5.0f, color);
+		draw_icon_stroke(x + 3.0f, y + 5.0f, x + 14.0f, y + 3.0f, color);
+		draw_icon_stroke(x + 14.0f, y + 3.0f, x + 14.0f, y + 20.0f, color);
+		draw_icon_stroke(x + 14.0f, y + 20.0f, x + 3.0f, y + 22.0f, color);
+		draw_icon_stroke(x + 3.0f, y + 22.0f, x + 3.0f, y + 5.0f, color);
+		draw_icon_stroke(x + 14.0f, y + 7.0f, x + 24.0f, y + 9.0f, color);
+		draw_icon_stroke(x + 24.0f, y + 9.0f, x + 24.0f, y + 24.0f, color);
+		draw_icon_stroke(x + 24.0f, y + 24.0f, x + 14.0f, y + 20.0f, color);
+		draw_icon_stroke(x + 14.0f, y + 7.0f, x + 14.0f, y + 20.0f, color);
+		draw_icon_stroke(x + 6.0f, y + 9.0f, x + 11.0f, y + 8.0f, color);
+		draw_icon_stroke(x + 6.0f, y + 13.0f, x + 11.0f, y + 12.0f, color);
+		draw_icon_stroke(x + 17.0f, y + 12.0f, x + 21.0f, y + 13.0f, color);
+		draw_icon_stroke(x + 17.0f, y + 16.0f, x + 21.0f, y + 17.0f, color);
 	} else {
 		draw_icon_ring(x, y, color);
 		vita2d_draw_fill_circle(x + 12.0f, y + 12.0f, 4.0f, color);
@@ -728,19 +936,39 @@ static void draw_close_icon(float x, float y, uint32_t color) {
 	draw_icon_stroke(x + 21.0f, y + 3.0f, x + 3.0f, y + 21.0f, color);
 }
 
-static void draw_quick_card(float x, uint32_t icon_color, const char *title, const char *line_one, const char *line_two) {
-	draw_border(x, 278.0f, 160.0f, 126.0f, 9.0f, COLOR_CARD_EDGE, RGBA8(19, 22, 40, 255));
+static void draw_quick_card(float x, uint32_t icon_color, const char *title, const char *line_one,
+	const char *line_two, int selected) {
+	draw_border(x, 278.0f, 160.0f, 126.0f, 9.0f, selected ? COLOR_TEXT : COLOR_CARD_EDGE,
+		selected ? RGBA8(35, 29, 52, 255) : RGBA8(19, 22, 40, 255));
 	draw_sidebar_icon(x + 29.0f, 294.0f, 0, icon_color);
-	draw_text(x + 17.0f, 348.0f, 0.88f, COLOR_TEXT, title);
+	draw_text_fit(x + 17.0f, 348.0f, 126.0f, 0.82f, COLOR_TEXT, title);
 	draw_text(x + 17.0f, 370.0f, 0.7f, COLOR_MUTED, line_one);
 	draw_text(x + 17.0f, 390.0f, 0.7f, COLOR_MUTED, line_two);
+}
+
+static int quick_prompt_count(void) {
+	return game_context ? CHAT_SUGGESTION_COUNT : 3;
+}
+
+static void move_quick_prompt_selection(int delta) {
+	int count = quick_prompt_count();
+	if (count <= 0) {
+		quick_prompt_selection = -1;
+		return;
+	}
+	if (quick_prompt_selection < 0) quick_prompt_selection = 0;
+	quick_prompt_selection = (quick_prompt_selection + delta + count) % count;
 }
 
 static void draw_chat_header(void) {
 	draw_round_rect(28.0f, 22.0f, 904.0f, 510.0f, 18.0f, COLOR_CARD_RIGHT);
 	vita2d_draw_rectangle(29.0f, 101.0f, 902.0f, 1.0f, COLOR_CARD_EDGE);
 	draw_menu_icon(77.0f, 64.0f, COLOR_TEXT);
-	draw_logo(177.0f, 42.0f);
+	if (game_context && game_logo != NULL) {
+		vita2d_draw_texture_scale(game_logo, 177.0f, 42.0f, 0.40f, 0.40f);
+	} else {
+		draw_logo(177.0f, 42.0f);
+	}
 	draw_text(262.0f, 78.0f, 1.55f, COLOR_TEXT, "VagaChatVITA");
 
 	uint32_t model_border = screen == SCREEN_CHAT && chat_focus == 2 ? COLOR_ACCENT : COLOR_CARD_EDGE;
@@ -781,14 +1009,41 @@ static void draw_chat_sidebar(int selected) {
 
 static void draw_chat_landing(void) {
 	draw_border_width(145.0f, 121.0f, 775.0f, 300.0f, 17.0f, 2.0f, COLOR_CARD_EDGE, RGBA8(11, 15, 30, 255));
-	draw_logo(492.0f, 143.0f);
+	if (game_context && game_logo != NULL) {
+		vita2d_draw_texture_scale(game_logo, 492.0f, 143.0f, 0.40f, 0.40f);
+	} else {
+		draw_logo(492.0f, 143.0f);
+	}
 	draw_text_centered(145.0f, 226.0f, 775.0f, 2.05f, COLOR_TEXT, "Nueva conversacion");
-	draw_text_centered(145.0f, 253.0f, 775.0f, 0.9f, COLOR_MUTED, "Escribe una pregunta, pide ayuda o genera ideas.");
+	if (!game_context) {
+		draw_text_centered(145.0f, 253.0f, 775.0f, 0.9f, COLOR_MUTED, "Escribe una pregunta, pide ayuda o genera ideas.");
+		draw_quick_card(250.0f, COLOR_ACCENT_SOFT, "Explicame este", "Entiende y", "soluciona errores.", chat_focus == 3 && quick_prompt_selection == 0);
+		draw_quick_card(430.0f, RGBA8(35, 133, 255, 255), "Resume un texto", "Obten un resumen", "claro y conciso.", chat_focus == 3 && quick_prompt_selection == 1);
+		draw_quick_card(610.0f, COLOR_ACCENT, "Genera ideas", "Brainstorm de", "ideas utiles.", chat_focus == 3 && quick_prompt_selection == 2);
+		return;
+	}
 
-	draw_quick_card(174.0f, COLOR_ACCENT_SOFT, "Explicame este", "Entiende y", "soluciona errores.");
-	draw_quick_card(360.0f, RGBA8(35, 133, 255, 255), "Resume un texto", "Obten un resumen", "claro y conciso.");
-	draw_quick_card(546.0f, COLOR_ACCENT, "Genera ideas", "Brainstorm de", "ideas utiles.");
-	draw_quick_card(732.0f, COLOR_SUCCESS, "Crear imagen", "Genera imagenes", "(beta).");
+	draw_text_centered(145.0f, 253.0f, 775.0f, 0.9f, COLOR_MUTED, game_title);
+	ChatSuggestionState state = chat_suggestion_state();
+	const char *loading_titles[] = { "Cargando.", "Cargando..", "Cargando..." };
+	const char *loading_title = loading_titles[landing_animation / 20 % 3];
+	for (int index = 0; index < CHAT_SUGGESTION_COUNT; ++index) {
+		char suggestion[CHAT_SUGGESTION_MAX_BYTES + 1] = { 0 };
+		if (state == CHAT_SUGGESTIONS_READY) {
+			chat_copy_suggestion(index, suggestion, sizeof(suggestion));
+			draw_quick_card(174.0f + index * 186.0f, index == 0 ? COLOR_ACCENT_SOFT : index == 1 ? RGBA8(35, 133, 255, 255) : index == 2 ? COLOR_ACCENT : COLOR_SUCCESS,
+				suggestion, "Pregunta sugerida", "Pulsa para consultar",
+				chat_focus == 3 && quick_prompt_selection == index);
+		} else if (state == CHAT_SUGGESTIONS_LOADING) {
+			draw_quick_card(174.0f + index * 186.0f, COLOR_ACCENT,
+				loading_title, "Consultando al", "modelo...", chat_focus == 3 && quick_prompt_selection == index);
+		} else {
+			draw_quick_card(174.0f + index * 186.0f, COLOR_SUBTLE,
+				"Sin sugerencia", state == CHAT_SUGGESTIONS_ERROR ? "No se pudo" : "Selecciona otro", "intentar luego.",
+				chat_focus == 3 && quick_prompt_selection == index);
+		}
+	}
+	++landing_animation;
 }
 
 static int next_chat_line(const char *text, int *offset, char *line, int capacity, float width) {
@@ -845,17 +1100,169 @@ static int next_chat_line(const char *text, int *offset, char *line, int capacit
 	return 1;
 }
 
+static void markdown_strip_inline(const char *source, char *output, int capacity) {
+	int source_index = 0;
+	int output_index = 0;
+	while (source[source_index] != '\0' && output_index < capacity - 1) {
+		if (source[source_index] == '[') {
+			const char *label_end = strchr(source + source_index + 1, ']');
+			if (label_end != NULL && label_end[1] == '(') {
+				const char *url_end = strchr(label_end + 2, ')');
+				if (url_end != NULL) {
+					int label_length = (int)(label_end - source - source_index - 1);
+					if (label_length > capacity - output_index - 1) {
+						label_length = capacity - output_index - 1;
+					}
+					memcpy(output + output_index, source + source_index + 1, label_length);
+					output_index += label_length;
+					source_index = (int)(url_end - source) + 1;
+					continue;
+				}
+			}
+		}
+		if ((source[source_index] == '`' && source[source_index + 1] != '\0') ||
+			(source[source_index] == '*' && source[source_index + 1] == '*') ||
+			(source[source_index] == '_' && source[source_index + 1] == '_') ||
+			(source[source_index] == '~' && source[source_index + 1] == '~')) {
+			int marker_length = source[source_index] == '`' ? 1 : 2;
+			source_index += marker_length;
+			continue;
+		}
+		output[output_index++] = source[source_index++];
+	}
+	output[output_index] = '\0';
+}
+
+static void markdown_copy_prefixed(char *output, int capacity, const char *prefix, const char *source) {
+	int prefix_length = (int)strlen(prefix);
+	if (prefix_length >= capacity) {
+		output[0] = '\0';
+		return;
+	}
+	memcpy(output, prefix, prefix_length);
+	markdown_strip_inline(source, output + prefix_length, capacity - prefix_length);
+}
+
+static int markdown_normalize_line(const char *source, char *output, int capacity, int *code_block, int *style) {
+	const char *start = source;
+	while (*start == ' ' || *start == '\t') {
+		++start;
+	}
+	if (strncmp(start, "```", 3) == 0) {
+		*code_block = !*code_block;
+		*style = 0;
+		output[0] = '\0';
+		return 0;
+	}
+	if (*code_block) {
+		markdown_strip_inline(source, output, capacity);
+		*style = 2;
+		return 1;
+	}
+
+	*style = 0;
+	if (start[0] == '#' && start[1] != '\0') {
+		int hashes = 0;
+		while (start[hashes] == '#' && hashes < 3) {
+			++hashes;
+		}
+		if (hashes > 0 && start[hashes] == ' ') {
+			while (start[hashes] == ' ') {
+				++hashes;
+			}
+			start += hashes;
+			*style = 1;
+		}
+	}
+	if (*style == 0 && start[0] == '>' && start[1] == ' ') {
+		start += 2;
+		*style = 3;
+	}
+	if (*style == 0 && (start[0] == '-' || start[0] == '*' || start[0] == '+') && start[1] == ' ') {
+		start += 2;
+		*style = 4;
+		markdown_copy_prefixed(output, capacity, "- ", start);
+		return 1;
+	}
+	if (*style == 0) {
+		int digits = 0;
+		while (start[digits] >= '0' && start[digits] <= '9') {
+			++digits;
+		}
+		if (digits > 0 && start[digits] == '.' && start[digits + 1] == ' ') {
+			start += digits + 2;
+			*style = 4;
+			markdown_copy_prefixed(output, capacity, "- ", start);
+			return 1;
+		}
+	}
+	markdown_strip_inline(start, output, capacity);
+	return 1;
+}
+
+typedef struct {
+	const char *source;
+	int source_offset;
+	int code_block;
+	int pending_active;
+	int pending_offset;
+	int pending_style;
+	char pending[CHAT_MAX_MESSAGE_BYTES + 1];
+} MarkdownCursor;
+
+static int next_markdown_line(MarkdownCursor *cursor, char *line, int capacity, float width, int *style) {
+	for (;;) {
+		if (cursor->pending_active) {
+			*style = cursor->pending_style;
+			if (cursor->pending[0] == '\0') {
+				line[0] = '\0';
+				cursor->pending_active = 0;
+				return 1;
+			}
+			if (next_chat_line(cursor->pending, &cursor->pending_offset, line, capacity, width)) {
+				if (cursor->pending[cursor->pending_offset] == '\0') {
+					cursor->pending_active = 0;
+				}
+				return 1;
+			}
+			cursor->pending_active = 0;
+		}
+
+		if (cursor->source[cursor->source_offset] == '\0') {
+			return 0;
+		}
+		int raw_length = 0;
+		while (cursor->source[cursor->source_offset] != '\0' &&
+			cursor->source[cursor->source_offset] != '\n') {
+			if (raw_length < CHAT_MAX_MESSAGE_BYTES) {
+				cursor->pending[raw_length++] = cursor->source[cursor->source_offset];
+			}
+			++cursor->source_offset;
+		}
+		if (cursor->source[cursor->source_offset] == '\n') {
+			++cursor->source_offset;
+		}
+		cursor->pending[raw_length] = '\0';
+		char raw[CHAT_MAX_MESSAGE_BYTES + 1];
+		memcpy(raw, cursor->pending, raw_length + 1);
+		cursor->pending_active = markdown_normalize_line(raw, cursor->pending,
+			sizeof(cursor->pending), &cursor->code_block, &cursor->pending_style);
+		cursor->pending_offset = 0;
+	}
+}
+
 static int chat_line_count(const char *text, float width) {
+	MarkdownCursor cursor = { text, 0, 0, 0, 0, 0, { 0 } };
 	char line[192];
-	int offset = 0;
+	int style = 0;
 	int count = 0;
-	while (next_chat_line(text, &offset, line, sizeof(line), width)) {
+	while (next_markdown_line(&cursor, line, sizeof(line), width, &style)) {
 		++count;
 	}
 	return count > 0 ? count : 1;
 }
 
-static void draw_chat_message(int index, int count, int y, int height) {
+static void draw_chat_message(int index, int count, int y, int height, int clip_top, int clip_bottom) {
 	ChatRole role = CHAT_ROLE_USER;
 	char content[CHAT_MAX_MESSAGE_BYTES + 1];
 	if (chat_copy_message(index, &role, content, sizeof(content)) < 0) {
@@ -869,13 +1276,37 @@ static void draw_chat_message(int index, int count, int y, int height) {
 	draw_text((float)bubble_x + 16.0f, (float)y + 21.0f, 0.66f, role_color,
 		role == CHAT_ROLE_USER ? "Tu" : "VagaRoute AI");
 
+	MarkdownCursor cursor = { 0 };
+	cursor.source = content;
 	char line[192];
-	int source = 0;
 	int line_number = 0;
+	int line_style = 0;
 	const float text_width_limit = (float)bubble_width - 32.0f;
-	while (next_chat_line(content, &source, line, sizeof(line), text_width_limit)) {
-		draw_text((float)bubble_x + 16.0f, (float)y + 43.0f + line_number * 20.0f,
-			0.70f, COLOR_TEXT, line[0] != '\0' ? line : " ");
+	while (next_markdown_line(&cursor, line, sizeof(line), text_width_limit, &line_style)) {
+		int line_y = y + 43 + line_number * 20;
+		if (line_y + 4 >= clip_top && line_y - 16 < clip_bottom) {
+			float text_scale = 0.70f;
+			uint32_t text_color = COLOR_TEXT;
+			if (line_style == 1) {
+				text_scale = 0.82f;
+				text_color = role_color;
+			} else if (line_style == 2) {
+				text_scale = 0.68f;
+				text_color = RGBA8(181, 201, 184, 255);
+			} else if (line_style == 3) {
+				text_color = COLOR_ACCENT_SOFT;
+			}
+			if (line_style == 2) {
+				vita2d_draw_rectangle((float)bubble_x + 11.0f, (float)line_y - 16.0f,
+					(float)bubble_width - 22.0f, 19.0f, RGBA8(14, 25, 27, 255));
+			}
+			if (line_style == 3) {
+				vita2d_draw_rectangle((float)bubble_x + 12.0f, (float)line_y - 14.0f,
+					2.0f, 15.0f, COLOR_ACCENT_SOFT);
+			}
+			draw_text((float)bubble_x + 16.0f, (float)line_y,
+				text_scale, text_color, line[0] != '\0' ? line : " ");
+		}
 		++line_number;
 	}
 	if (line_number == 0) {
@@ -940,7 +1371,10 @@ static void draw_chat_history(void) {
 	vita2d_set_clip_rectangle(view_left, view_top, view_right, view_bottom);
 	vita2d_enable_clipping();
 	for (int index = 0; index < count && index < CHAT_MAX_MESSAGES; ++index) {
-		draw_chat_message(index, count, content_y, heights[index]);
+		/* Clipping does not avoid allocating the off-screen geometry. */
+		if (content_y < view_bottom && content_y + heights[index] > view_top) {
+			draw_chat_message(index, count, content_y, heights[index], view_top, view_bottom);
+		}
 		content_y += heights[index] + message_gap;
 	}
 	vita2d_disable_clipping();
@@ -948,12 +1382,14 @@ static void draw_chat_history(void) {
 	if (chat_scroll_max > 0) {
 		uint32_t scroll_color = COLOR_MUTED;
 		if (chat_scroll_offset > 0) {
-			vita2d_draw_line(894.0f, 128.0f, 889.0f, 134.0f, scroll_color);
-			vita2d_draw_line(889.0f, 134.0f, 899.0f, 134.0f, scroll_color);
+			draw_icon_stroke(883.0f, 141.0f, 894.0f, 127.0f, scroll_color);
+			draw_icon_stroke(894.0f, 127.0f, 905.0f, 141.0f, scroll_color);
+			draw_icon_stroke(894.0f, 127.0f, 894.0f, 145.0f, scroll_color);
 		}
 		if (chat_scroll_offset < chat_scroll_max) {
-			vita2d_draw_line(889.0f, 389.0f, 899.0f, 389.0f, scroll_color);
-			vita2d_draw_line(899.0f, 389.0f, 894.0f, 395.0f, scroll_color);
+			draw_icon_stroke(883.0f, 379.0f, 894.0f, 393.0f, scroll_color);
+			draw_icon_stroke(894.0f, 393.0f, 905.0f, 379.0f, scroll_color);
+			draw_icon_stroke(894.0f, 375.0f, 894.0f, 393.0f, scroll_color);
 		}
 	}
 }
@@ -983,13 +1419,47 @@ static void draw_history_modal(void) {
 	}
 }
 
-static void draw_info_modal(void) {
+static void draw_library_modal(void) {
 	vita2d_draw_rectangle(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, RGBA8(3, 5, 12, 190));
-	draw_border_width(210.0f, 155.0f, 540.0f, 190.0f, 18.0f, 2.0f, COLOR_CARD_EDGE, RGBA8(13, 17, 34, 255));
-	draw_text(245.0f, 210.0f, 1.2f, COLOR_TEXT, "Imagenes beta");
-	draw_close_icon(700.0f, 178.0f, COLOR_MUTED);
-	draw_text(245.0f, 247.0f, 0.82f, COLOR_MUTED, "Este modulo estara disponible proximamente.");
-	draw_text(245.0f, 273.0f, 0.78f, COLOR_SUBTLE, "La navegacion ya esta preparada para esta seccion.");
+	draw_border_width(42.0f, 44.0f, 876.0f, 456.0f, 18.0f, 2.0f, COLOR_CARD_EDGE, RGBA8(13, 17, 34, 255));
+	draw_text(78.0f, 92.0f, 1.55f, COLOR_TEXT, "Libreria");
+	draw_text(78.0f, 117.0f, 0.76f, COLOR_MUTED, "Titulos instalados en la consola.");
+	draw_close_icon(866.0f, 67.0f, COLOR_MUTED);
+
+	if (library_count == 0) {
+		draw_text_centered(78.0f, 280.0f, 804.0f, 0.9f, COLOR_MUTED, "No se encontraron titulos instalados.");
+	} else {
+		int first = library_page * LIBRARY_PAGE_SIZE;
+		int visible = library_count - first;
+		if (visible > LIBRARY_PAGE_SIZE) visible = LIBRARY_PAGE_SIZE;
+		for (int slot = 0; slot < visible; ++slot) {
+			int index = first + slot;
+			int column = slot % 4;
+			int row = slot / 4;
+			float x = 64.0f + column * 211.0f;
+			float y = 140.0f + row * 155.0f;
+			uint32_t border = index == library_selection ? COLOR_ACCENT : COLOR_CARD_EDGE;
+			draw_border( x, y, 198.0f, 135.0f, 10.0f, border, RGBA8(19, 23, 43, 255));
+			if (library_titles[index].icon != NULL) {
+				vita2d_draw_texture_scale(library_titles[index].icon, x + 10.0f, y + 10.0f, 0.56f, 0.56f);
+			} else {
+				draw_sidebar_icon(x + 30.0f, y + 30.0f, 2, COLOR_SUBTLE);
+			}
+			draw_text_fit(x + 86.0f, y + 36.0f, 100.0f, 0.76f, COLOR_TEXT, library_titles[index].title);
+			draw_text_fit(x + 86.0f, y + 62.0f, 100.0f, 0.62f, COLOR_MUTED, library_titles[index].title_id);
+			if (index == library_selection) {
+				draw_text(x + 86.0f, y + 105.0f, 0.62f, COLOR_ACCENT, "Seleccionado");
+			}
+		}
+	}
+
+	if (library_count > LIBRARY_PAGE_SIZE) {
+		int pages = (library_count + LIBRARY_PAGE_SIZE - 1) / LIBRARY_PAGE_SIZE;
+		char page_text[32];
+		snprintf(page_text, sizeof(page_text), "%s %d/%d", i18n_translate("Pagina"), library_page + 1, pages);
+		draw_text_centered(78.0f, 479.0f, 804.0f, 0.68f, COLOR_MUTED, page_text);
+	}
+	draw_text(78.0f, 487.0f, 0.6f, COLOR_SUBTLE, "D-PAD mover   CRUZ seleccionar   CIRCULO cerrar");
 }
 
 static void draw_side_menu_overlay(void) {
@@ -1017,13 +1487,114 @@ static int sidebar_item_at(int x, int y) {
 	return -1;
 }
 
+static int library_item_at(int x, int y) {
+	if (x < 64 || x >= 906 || y < 140 || y >= 430) {
+		return -1;
+	}
+	int column = (x - 64) / 211;
+	int row = (y - 140) / 155;
+	if (column < 0 || column >= 4 || row < 0 || row >= 2 ||
+		x >= 64 + column * 211 + 198 || y >= 140 + row * 155 + 135) {
+		return -1;
+	}
+	int index = library_page * LIBRARY_PAGE_SIZE + row * 4 + column;
+	return index < library_count ? index : -1;
+}
+
+static void move_library_selection(int delta) {
+	if (library_count <= 0) {
+		library_selection = 0;
+		library_page = 0;
+		return;
+	}
+	library_selection += delta;
+	if (library_selection < 0) library_selection = library_count - 1;
+	if (library_selection >= library_count) library_selection = 0;
+	library_page = library_selection / LIBRARY_PAGE_SIZE;
+}
+
+static void clear_game_context(void) {
+	chat_cancel_suggestions();
+	if (game_logo != NULL) {
+		vita2d_free_texture(game_logo);
+		game_logo = NULL;
+	}
+	game_context = 0;
+	game_title[0] = '\0';
+	game_title_id[0] = '\0';
+}
+
+static void open_game_chat(int index) {
+	if (index < 0 || index >= library_count) return;
+	clear_game_context();
+	if (chat_new_conversation() < 0) {
+		set_status("CANCELA LA RESPUESTA ANTES DE ABRIR OTRO CHAT.", 1);
+		return;
+	}
+	game_context = 1;
+	library_copy_text(game_title, sizeof(game_title), library_titles[index].title);
+	library_copy_text(game_title_id, sizeof(game_title_id), library_titles[index].title_id);
+	char icon_path[320];
+	snprintf(icon_path, sizeof(icon_path), "ux0:app/%s/sce_sys/icon0.png", game_title_id);
+	game_logo = vita2d_load_PNG_file(icon_path);
+	message_text[0] = '\0';
+	quick_prompt_selection = -1;
+	chat_follow_bottom = 1;
+	chat_scroll_offset = 0;
+	screen = SCREEN_CHAT;
+	library_modal = 0;
+	history_modal = 0;
+	landing_animation = 0;
+	set_status("CARGANDO IDEAS DEL TITULO...", 0);
+	if (chat_request_suggestions(endpoint_url, api_key, selected_model, game_title, game_title_id) < 0) {
+		set_status("NO SE PUDIERON CARGAR LAS IDEAS.", 1);
+	}
+}
+
+static int prompt_card_at(int x, int y) {
+	if (y < 278 || y >= 404) return -1;
+	if (game_context) {
+		for (int index = 0; index < CHAT_SUGGESTION_COUNT; ++index) {
+			int left = 174 + index * 186;
+			if (x >= left && x < left + 160) return index;
+		}
+	} else {
+		static const int left[] = { 250, 430, 610 };
+		for (int index = 0; index < 3; ++index) {
+			if (x >= left[index] && x < left[index] + 160) return index;
+		}
+	}
+	return -1;
+}
+
+static void select_prompt_card(int index) {
+	if (index < 0) return;
+	if (game_context) {
+		if (chat_suggestion_state() != CHAT_SUGGESTIONS_READY ||
+			chat_copy_suggestion(index, message_text, sizeof(message_text)) < 0) {
+			return;
+		}
+		chat_cancel_suggestions();
+	} else {
+		static const char *prompts[] = {
+			"Explicame este tema paso a paso.",
+			"Resume este texto de forma clara.",
+			"Dame ideas para empezar."
+		};
+		if (index >= 3) return;
+		library_copy_text(message_text, sizeof(message_text), prompts[index]);
+	}
+	send_message();
+}
+
 static void activate_side_menu(void) {
 	side_menu_open = 0;
 	history_modal = 0;
-	info_modal = 0;
+	library_modal = 0;
 	status_message[0] = '\0';
 
 	if (side_menu_selection == 0) {
+		clear_game_context();
 		message_text[0] = '\0';
 		if (chat_new_conversation() < 0) {
 			set_status("CANCELA LA RESPUESTA ANTES DE CREAR OTRO CHAT.", 1);
@@ -1032,6 +1603,7 @@ static void activate_side_menu(void) {
 		}
 		chat_follow_bottom = 1;
 		chat_scroll_offset = 0;
+		quick_prompt_selection = -1;
 		screen = user_name[0] == '\0' ? SCREEN_NAME : SCREEN_CHAT;
 	} else if (side_menu_selection == 1) {
 		if (user_name[0] != '\0') {
@@ -1040,7 +1612,10 @@ static void activate_side_menu(void) {
 		history_modal = 1;
 		history_selection = chat_active_conversation();
 	} else if (side_menu_selection == 2) {
-		info_modal = 1;
+		library_scan();
+		library_selection = 0;
+		library_page = 0;
+		library_modal = 1;
 	} else {
 		screen = SCREEN_SETTINGS;
 		settings_focus = 0;
@@ -1055,16 +1630,14 @@ static void draw_chat_composer(void) {
 	vita2d_draw_line(186.0f, 467.0f, 194.0f, 475.0f, COLOR_TEXT);
 
 	uint32_t input_border = chat_focus == 0 ? COLOR_ACCENT_SOFT : COLOR_CARD_EDGE;
-	draw_border_width(226.0f, 443.0f, 390.0f, 48.0f, 10.0f, 2.0f, input_border, RGBA8(15, 19, 39, 255));
+	draw_border_width(226.0f, 443.0f, 529.0f, 48.0f, 10.0f, 2.0f, input_border, RGBA8(15, 19, 39, 255));
 	if (message_text[0] == '\0') {
 		draw_text(246.0f, 474.0f, 0.9f, COLOR_MUTED, "Escribe tu mensaje...");
 	} else {
-		draw_text_fit(246.0f, 474.0f, 350.0f, 0.82f, COLOR_TEXT, message_text);
+		draw_text_fit(246.0f, 474.0f, 489.0f, 0.82f, COLOR_TEXT, message_text);
 	}
 
-	uint32_t mode_color = input_mode == 0 ? COLOR_ACCENT : COLOR_SUCCESS;
-	draw_border_width(627.0f, 443.0f, 118.0f, 48.0f, 10.0f, 2.0f, mode_color, RGBA8(20, 24, 48, 255));
-	draw_text_centered(627.0f, 473.0f, 118.0f, 0.82f, mode_color, input_mode == 0 ? "Texto" : "Imagen");
+	/* The composer stays focused on text until image generation is implemented. */
 
 	uint32_t send_border = chat_focus == 1 ? COLOR_TEXT : COLOR_ACCENT;
 	draw_border_width(773.0f, 443.0f, 132.0f, 48.0f, 10.0f, 2.0f, send_border, COLOR_ACCENT);
@@ -1113,19 +1686,28 @@ static void draw_settings_interface(void) {
 		draw_text(194.0f, 339.0f, 0.82f, COLOR_TEXT, masked);
 	}
 
+	draw_text(620.0f, 367.0f, 0.72f, COLOR_MUTED, "IDIOMA");
+	uint32_t language_border = settings_focus == 4 ? COLOR_TEXT : COLOR_CARD_EDGE;
+	draw_border_width(620.0f, 372.0f, 253.0f, 42.0f, 9.0f, 2.0f, language_border, COLOR_FIELD);
+	draw_text_centered(620.0f, 399.0f, 253.0f, 0.76f, COLOR_TEXT, i18n_language_name(app_language));
+
 	uint32_t verify_border = settings_focus == 3 ? COLOR_TEXT : COLOR_ACCENT;
 	draw_border_width(173.0f, 372.0f, 220.0f, 42.0f, 9.0f, 2.0f, verify_border, COLOR_ACCENT);
 	draw_text_centered(173.0f, 399.0f, 220.0f, 0.76f, RGBA8(25, 19, 16, 255), "Verificar conexion");
 
-	uint32_t back_border = settings_focus == 4 ? COLOR_TEXT : COLOR_CARD_EDGE;
+	uint32_t web_border = settings_focus == 5 ? COLOR_TEXT : COLOR_ACCENT;
+	draw_border_width(620.0f, 425.0f, 253.0f, 42.0f, 9.0f, 2.0f, web_border, COLOR_ACCENT);
+	draw_text_centered(620.0f, 452.0f, 253.0f, 0.72f, RGBA8(25, 19, 16, 255), "Configuracion web");
+
+	uint32_t back_border = settings_focus == 6 ? COLOR_TEXT : COLOR_CARD_EDGE;
 	draw_border_width(413.0f, 372.0f, 180.0f, 42.0f, 9.0f, 2.0f, back_border, RGBA8(20, 24, 48, 255));
 	draw_text_centered(413.0f, 399.0f, 180.0f, 0.76f, COLOR_TEXT, "Volver al chat");
 
-	draw_text(173.0f, 440.0f, 0.7f, connection_state == CONNECTION_ONLINE ? COLOR_SUCCESS : COLOR_MUTED, connection_state == CONNECTION_ONLINE ? "CONEXION DISPONIBLE" : connection_state == CONNECTION_VERIFYING ? "VERIFICANDO CONEXION..." : "SIN CONEXION");
+	draw_text(173.0f, 440.0f, 0.7f, connection_state == CONNECTION_ONLINE ? COLOR_SUCCESS : COLOR_MUTED, connection_state == CONNECTION_VERIFYING ? "VERIFICANDO CONEXION..." : connection_state == CONNECTION_ONLINE ? "CONEXION DISPONIBLE" : "SIN CONEXION");
 	if (status_message[0] != '\0') {
-		draw_text(173.0f, 463.0f, 0.7f, status_is_error ? COLOR_ERROR : COLOR_SUCCESS, status_message);
+		draw_text(173.0f, 474.0f, 0.7f, status_is_error ? COLOR_ERROR : COLOR_SUCCESS, status_message);
 	}
-	draw_text(500.0f, 463.0f, 0.64f, COLOR_SUBTLE, "CONFIG LOCAL");
+	draw_text(500.0f, 474.0f, 0.64f, COLOR_SUBTLE, "CONFIG LOCAL");
 
 	vita2d_draw_rectangle(29.0f, 502.0f, 902.0f, 30.0f, RGBA8(12, 15, 30, 255));
 	draw_text(48.0f, 524.0f, 0.6f, COLOR_MUTED, "SELECT  Menu");
@@ -1138,6 +1720,28 @@ static void draw_settings_interface(void) {
 	if (keyboard_open) {
 		draw_keyboard();
 	}
+}
+
+static void draw_web_config_interface(void) {
+	draw_background();
+	draw_round_rect(CARD_X, CARD_Y, CARD_WIDTH, CARD_HEIGHT, CARD_RADIUS, COLOR_CARD_RIGHT);
+	draw_menu_icon(77.0f, 64.0f, COLOR_TEXT);
+	draw_text(173.0f, 150.0f, 1.9f, COLOR_TEXT, "Configuracion web");
+	draw_text(173.0f, 178.0f, 0.82f, COLOR_MUTED, "Configura VagaRoute AI desde un PC o telefono.");
+	draw_border_width(173.0f, 210.0f, 700.0f, 150.0f, 15.0f, 2.0f, COLOR_ACCENT, RGBA8(17, 21, 43, 255));
+	draw_text(205.0f, 250.0f, 0.78f, COLOR_MUTED, "ABRE ESTA DIRECCION EN EL MISMO WIFI");
+	char ip[WEB_CONFIG_IP_CAPACITY] = "0.0.0.0";
+	web_config_copy_ip(ip, sizeof(ip));
+	char address[64];
+	snprintf(address, sizeof(address), "http://%s:%d", ip, WEB_CONFIG_PORT);
+	draw_text_fit(205.0f, 300.0f, 630.0f, 1.35f, COLOR_TEXT, address);
+	draw_text(205.0f, 334.0f, 0.70f, web_config_is_running() ? COLOR_SUCCESS : COLOR_ERROR,
+		web_config_is_running() ? "SERVIDOR ACTIVO" : "SERVIDOR DETENIDO");
+
+	uint32_t exit_border = COLOR_ACCENT;
+	draw_border_width(173.0f, 400.0f, 260.0f, 48.0f, 10.0f, 2.0f, exit_border, COLOR_ACCENT);
+	draw_text_centered(173.0f, 431.0f, 260.0f, 0.84f, RGBA8(25, 19, 16, 255), "Salir");
+	draw_text(173.0f, 480.0f, 0.70f, COLOR_MUTED, "CIRCULO: salir   START: cerrar aplicacion");
 }
 
 static void draw_chat_interface(void) {
@@ -1390,6 +1994,8 @@ static int save_name_and_open_chat(void) {
 		focus = 0;
 		return -1;
 	}
+	language_configured = 1;
+	i18n_set_language(app_language);
 	if (save_name() < 0) {
 		set_status("NO SE PUDO GUARDAR.", 1);
 		return -1;
@@ -1399,6 +2005,13 @@ static int save_name_and_open_chat(void) {
 	chat_focus = 0;
 	status_message[0] = '\0';
 	return 0;
+}
+
+static void change_language(int delta) {
+	app_language = delta > 0 ? i18n_next_language(app_language) : i18n_previous_language(app_language);
+	i18n_set_language(app_language);
+	language_configured = 1;
+	save_config();
 }
 
 static int point_in_rect(int x, int y, float left, float top, float width, float height) {
@@ -1471,6 +2084,8 @@ static void draw_frame(void) {
 		draw_name_interface();
 	} else if (screen == SCREEN_SETTINGS) {
 		draw_settings_interface();
+	} else if (screen == SCREEN_WEB_CONFIG) {
+		draw_web_config_interface();
 	} else {
 		draw_chat_interface();
 	}
@@ -1480,8 +2095,8 @@ static void draw_frame(void) {
 	if (history_modal) {
 		draw_history_modal();
 	}
-	if (info_modal) {
-		draw_info_modal();
+	if (library_modal) {
+		draw_library_modal();
 	}
 	if (side_menu_open) {
 		draw_side_menu_overlay();
@@ -1500,11 +2115,16 @@ static void send_message(void) {
 		set_status("SELECCIONA UN MODELO.", 1);
 		return;
 	}
-	if (input_mode != 0) {
-		set_status("LA GENERACION DE IMAGENES SIGUE EN BETA.", 1);
-		return;
+	if (game_context) {
+		chat_cancel_suggestions();
 	}
-	if (chat_send(endpoint_url, api_key, selected_model, message_text) < 0) {
+	char context_prompt[2048] = { 0 };
+	if (game_context) {
+		i18n_game_system_prompt(app_language, game_title, game_title_id,
+			context_prompt, sizeof(context_prompt));
+	}
+	if (chat_send(endpoint_url, api_key, selected_model, message_text,
+		i18n_normal_system_prompt(app_language), game_context ? context_prompt : NULL) < 0) {
 		char chat_status[64];
 		chat_copy_status(chat_status, sizeof(chat_status));
 		set_status(chat_request_state() == CHAT_REQUEST_STREAMING ? "ESPERA O CANCELA LA RESPUESTA." :
@@ -1757,12 +2377,57 @@ static int verify_connection(void) {
 	return 0;
 }
 
+static void open_web_config(void) {
+	if (!net_initialized || !netctl_initialized) {
+		set_status("RED NO DISPONIBLE.", 1);
+		return;
+	}
+	int network_state = SCE_NETCTL_STATE_DISCONNECTED;
+	if (sceNetCtlInetGetState(&network_state) < 0 || network_state != SCE_NETCTL_STATE_CONNECTED) {
+		set_status("CONECTA LA VITA A UNA RED WIFI.", 1);
+		return;
+	}
+	SceNetCtlInfo info = { 0 };
+	if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS, &info) < 0 || info.ip_address[0] == '\0') {
+		set_status("NO SE PUDO OBTENER LA IP.", 1);
+		return;
+	}
+	if (web_config_start(info.ip_address, endpoint_url, api_key,
+		web_password_hash, web_password_configured) < 0) {
+		set_status("NO SE PUDO INICIAR EL SERVIDOR WEB.", 1);
+		return;
+	}
+	screen = SCREEN_WEB_CONFIG;
+	status_message[0] = '\0';
+}
+
+static void update_web_config(void) {
+	char updated_endpoint[ENDPOINT_CAPACITY + 1];
+	char updated_api_key[API_KEY_CAPACITY + 1];
+	unsigned char updated_password_hash[WEB_CONFIG_PASSWORD_HASH_BYTES];
+	int password_configured = 0;
+	if (!web_config_take_pending(updated_endpoint, sizeof(updated_endpoint), updated_api_key,
+		sizeof(updated_api_key), updated_password_hash, &password_configured)) return;
+	strncpy(endpoint_url, updated_endpoint, sizeof(endpoint_url) - 1);
+	endpoint_url[sizeof(endpoint_url) - 1] = '\0';
+	strncpy(api_key, updated_api_key, sizeof(api_key) - 1);
+	api_key[sizeof(api_key) - 1] = '\0';
+	memcpy(web_password_hash, updated_password_hash, sizeof(web_password_hash));
+	web_password_configured = password_configured;
+	if (save_config() < 0) {
+		set_status("CONFIGURACION RECIBIDA, PERO NO SE PUDO GUARDAR.", 1);
+	} else {
+		set_status("CONFIGURACION WEB GUARDADA.", 0);
+	}
+}
+
 int main(void) {
 	load_config();
+	i18n_set_language(app_language);
 	if (config_needs_rewrite) {
 		save_config();
 	}
-	screen = user_name[0] == '\0' ? SCREEN_NAME : SCREEN_CHAT;
+	screen = user_name[0] == '\0' || !language_configured ? SCREEN_NAME : SCREEN_CHAT;
 
 	if (vita2d_init() < 0) {
 		sceKernelExitProcess(1);
@@ -1806,6 +2471,7 @@ int main(void) {
 	}
 	uint32_t previous_buttons = 0;
 	ChatRequestState previous_chat_state = chat_request_state();
+	ChatSuggestionState previous_suggestion_state = chat_suggestion_state();
 
 	for (;;) {
 		SceCtrlData controller = { 0 };
@@ -1816,6 +2482,18 @@ int main(void) {
 		int touch_y = 0;
 		int touch_tapped = read_touch_tap(&touch_x, &touch_y);
 		chat_update();
+		update_web_config();
+		ChatSuggestionState current_suggestion_state = chat_suggestion_state();
+		if (game_context && current_suggestion_state != previous_suggestion_state) {
+			if (current_suggestion_state == CHAT_SUGGESTIONS_READY) {
+				status_message[0] = '\0';
+			} else if (current_suggestion_state == CHAT_SUGGESTIONS_ERROR) {
+				char suggestion_error[64];
+				chat_copy_suggestion_error(suggestion_error, sizeof(suggestion_error));
+				set_status(suggestion_error[0] != '\0' ? suggestion_error : "NO SE PUDIERON CARGAR LAS IDEAS.", 1);
+			}
+		}
+		previous_suggestion_state = current_suggestion_state;
 		ChatRequestState current_chat_state = chat_request_state();
 		if (current_chat_state != previous_chat_state) {
 			char chat_status[64];
@@ -1924,7 +2602,33 @@ int main(void) {
 			side_menu_open = 1;
 			side_menu_selection = screen == SCREEN_SETTINGS ? 3 : 0;
 			history_modal = 0;
-			info_modal = 0;
+			library_modal = 0;
+		} else if (library_modal) {
+			if (touch_tapped) {
+				if (point_in_rect(touch_x, touch_y, 840.0f, 50.0f, 54.0f, 54.0f) ||
+					!point_in_rect(touch_x, touch_y, 42.0f, 44.0f, 876.0f, 456.0f)) {
+					library_modal = 0;
+				} else {
+					int item = library_item_at(touch_x, touch_y);
+					if (item >= 0) {
+						library_selection = item;
+						library_page = item / LIBRARY_PAGE_SIZE;
+						open_game_chat(item);
+					}
+				}
+			} else if ((pressed & SCE_CTRL_CIRCLE) != 0 || (pressed & SCE_CTRL_TRIANGLE) != 0) {
+				library_modal = 0;
+			} else if ((pressed & SCE_CTRL_LEFT) != 0) {
+				move_library_selection(-1);
+			} else if ((pressed & SCE_CTRL_RIGHT) != 0) {
+				move_library_selection(1);
+			} else if ((pressed & SCE_CTRL_UP) != 0) {
+				move_library_selection(-4);
+			} else if ((pressed & SCE_CTRL_DOWN) != 0) {
+				move_library_selection(4);
+			} else if ((pressed & SCE_CTRL_CROSS) != 0) {
+				open_game_chat(library_selection);
+			}
 		} else if (history_modal) {
 			if (touch_tapped) {
 				if (point_in_rect(touch_x, touch_y, 730.0f, 98.0f, 54.0f, 54.0f) ||
@@ -1934,6 +2638,7 @@ int main(void) {
 					int row = (touch_y - 184) / 64;
 					int index = chat_conversation_count() - row - 1;
 					if (index >= 0 && chat_select_conversation(index) == 0) {
+						clear_game_context();
 						history_selection = index;
 						history_modal = 0;
 						chat_follow_bottom = 1;
@@ -1946,21 +2651,13 @@ int main(void) {
 				history_selection = (history_selection + chat_conversation_count() - 1) % chat_conversation_count();
 			} else if ((pressed & SCE_CTRL_CROSS) != 0) {
 				if (chat_select_conversation(history_selection) == 0) {
+					clear_game_context();
 					history_modal = 0;
 					chat_follow_bottom = 1;
 					chat_scroll_offset = 0;
 				}
 			} else if ((pressed & SCE_CTRL_CIRCLE) != 0 || (pressed & SCE_CTRL_TRIANGLE) != 0) {
 				history_modal = 0;
-			}
-		} else if (info_modal) {
-			if (touch_tapped) {
-				if (point_in_rect(touch_x, touch_y, 685.0f, 160.0f, 54.0f, 54.0f) ||
-					!point_in_rect(touch_x, touch_y, 210.0f, 155.0f, 540.0f, 190.0f)) {
-					info_modal = 0;
-				}
-			} else if ((pressed & SCE_CTRL_CIRCLE) != 0 || (pressed & SCE_CTRL_TRIANGLE) != 0) {
-				info_modal = 0;
 			}
 		} else if (screen == SCREEN_NAME) {
 			if (touch_tapped) {
@@ -1975,19 +2672,38 @@ int main(void) {
 					focus = 0;
 					open_keyboard(KEYBOARD_NAME);
 				} else if (point_in_rect(touch_x, touch_y, 526.0f, 286.0f, 350.0f, 38.0f)) {
+					focus = 1;
+					change_language(1);
+				} else if (point_in_rect(touch_x, touch_y, 526.0f, 342.0f, 350.0f, 38.0f)) {
 					save_name_and_open_chat();
 				}
 			} else if ((pressed & SCE_CTRL_UP) != 0 || (pressed & SCE_CTRL_DOWN) != 0) {
-				focus = focus == 0 ? 1 : 0;
+				focus = (focus + 1) % 3;
+			} else if ((pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT)) != 0 && focus == 1) {
+				change_language((pressed & SCE_CTRL_RIGHT) != 0 ? 1 : -1);
 			} else if ((pressed & SCE_CTRL_CROSS) != 0) {
 				if (focus == 0) {
 					open_keyboard(KEYBOARD_NAME);
+				} else if (focus == 1) {
+					change_language(1);
 				} else {
 					save_name_and_open_chat();
 				}
 			} else if ((pressed & SCE_CTRL_TRIANGLE) != 0 && focus == 0) {
 				user_name[0] = '\0';
 				set_status("NOMBRE BORRADO.", 0);
+			}
+		} else if (screen == SCREEN_WEB_CONFIG) {
+			if (touch_tapped && point_in_rect(touch_x, touch_y, 173.0f, 400.0f, 260.0f, 48.0f)) {
+				web_config_stop();
+				screen = SCREEN_SETTINGS;
+				settings_focus = 5;
+				status_message[0] = '\0';
+			} else if ((pressed & (SCE_CTRL_CIRCLE | SCE_CTRL_CROSS)) != 0) {
+				web_config_stop();
+				screen = SCREEN_SETTINGS;
+				settings_focus = 5;
+				status_message[0] = '\0';
 			}
 		} else if (screen == SCREEN_SETTINGS) {
 			if (touch_tapped) {
@@ -2011,6 +2727,9 @@ int main(void) {
 				} else if (point_in_rect(touch_x, touch_y, 173.0f, 313.0f, 700.0f, 38.0f)) {
 					settings_focus = 2;
 					open_keyboard(KEYBOARD_API_KEY);
+				} else if (point_in_rect(touch_x, touch_y, 620.0f, 372.0f, 253.0f, 42.0f)) {
+					settings_focus = 4;
+					change_language(1);
 				} else if (point_in_rect(touch_x, touch_y, 173.0f, 372.0f, 220.0f, 42.0f)) {
 					settings_focus = 3;
 					verify_connection();
@@ -2018,9 +2737,14 @@ int main(void) {
 					save_config();
 					screen = SCREEN_CHAT;
 					status_message[0] = '\0';
+				} else if (point_in_rect(touch_x, touch_y, 620.0f, 425.0f, 253.0f, 42.0f)) {
+					settings_focus = 5;
+					open_web_config();
 				}
 			} else if ((pressed & SCE_CTRL_UP) != 0 || (pressed & SCE_CTRL_DOWN) != 0) {
-				settings_focus = (settings_focus + 1) % 5;
+				settings_focus = (settings_focus + 1) % 7;
+			} else if ((pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT)) != 0 && settings_focus == 4) {
+				change_language((pressed & SCE_CTRL_RIGHT) != 0 ? 1 : -1);
 			} else if ((pressed & SCE_CTRL_CROSS) != 0) {
 				if (settings_focus == 0) {
 					open_keyboard(KEYBOARD_NAME);
@@ -2030,6 +2754,10 @@ int main(void) {
 					open_keyboard(KEYBOARD_API_KEY);
 				} else if (settings_focus == 3) {
 					verify_connection();
+				} else if (settings_focus == 4) {
+					change_language(1);
+				} else if (settings_focus == 5) {
+					open_web_config();
 				} else {
 					save_config();
 					screen = SCREEN_CHAT;
@@ -2049,14 +2777,14 @@ int main(void) {
 				} else if (item >= 0) {
 					side_menu_selection = item;
 					activate_side_menu();
-				} else if (point_in_rect(touch_x, touch_y, 226.0f, 443.0f, 390.0f, 48.0f)) {
+				} else if (point_in_rect(touch_x, touch_y, 226.0f, 443.0f, 529.0f, 48.0f)) {
 					chat_focus = 0;
 					open_keyboard(KEYBOARD_MESSAGE);
-				} else if (point_in_rect(touch_x, touch_y, 627.0f, 443.0f, 118.0f, 48.0f)) {
-					input_mode = input_mode == 0 ? 1 : 0;
 				} else if (point_in_rect(touch_x, touch_y, 773.0f, 443.0f, 132.0f, 48.0f)) {
 					chat_focus = 1;
 					send_message();
+				} else if (chat_message_count() == 0 && point_in_rect(touch_x, touch_y, 145.0f, 278.0f, 775.0f, 126.0f)) {
+					select_prompt_card(prompt_card_at(touch_x, touch_y));
 				} else if (point_in_rect(touch_x, touch_y, 480.0f, 45.0f, 340.0f, 50.0f)) {
 					open_model_selector();
 				}
@@ -2073,6 +2801,10 @@ int main(void) {
 				chat_scroll_offset += 220;
 				if (chat_scroll_offset > chat_scroll_max) chat_scroll_offset = chat_scroll_max;
 				if (chat_scroll_offset == chat_scroll_max) chat_follow_bottom = 1;
+			} else if (chat_message_count() == 0 && quick_prompt_count() > 0 &&
+				(pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT)) != 0) {
+				chat_focus = 3;
+				move_quick_prompt_selection((pressed & SCE_CTRL_RIGHT) != 0 ? 1 : -1);
 			} else if ((pressed & SCE_CTRL_LEFT) != 0) {
 				chat_follow_bottom = 0;
 				chat_scroll_offset -= 80;
@@ -2083,14 +2815,19 @@ int main(void) {
 				if (chat_scroll_offset > chat_scroll_max) chat_scroll_offset = chat_scroll_max;
 				if (chat_scroll_offset == chat_scroll_max) chat_follow_bottom = 1;
 			} else if ((pressed & SCE_CTRL_UP) != 0 || (pressed & SCE_CTRL_DOWN) != 0) {
-				chat_focus = (chat_focus + 1) % 3;
+				chat_focus = (chat_focus + 1) % (chat_message_count() == 0 ? 4 : 3);
+				if (chat_focus == 3 && quick_prompt_selection < 0) {
+					quick_prompt_selection = 0;
+				}
 			} else if ((pressed & SCE_CTRL_CROSS) != 0) {
 				if (chat_focus == 0) {
 					open_keyboard(KEYBOARD_MESSAGE);
 				} else if (chat_focus == 1) {
 					send_message();
-				} else {
+				} else if (chat_focus == 2) {
 					open_model_selector();
+				} else {
+					select_prompt_card(quick_prompt_selection);
 				}
 			} else if ((pressed & SCE_CTRL_TRIANGLE) != 0) {
 				open_model_selector();
@@ -2129,7 +2866,12 @@ int main(void) {
 	if (ime_module_loaded) {
 		sceSysmoduleUnloadModule(SCE_SYSMODULE_IME);
 	}
+	web_config_stop();
 	chat_shutdown();
+	if (game_logo != NULL) {
+		vita2d_free_texture(game_logo);
+	}
+	library_free();
 	if (curl_initialized) {
 		curl_global_cleanup();
 	}

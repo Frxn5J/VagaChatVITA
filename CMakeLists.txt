@@ -32,8 +32,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 
 add_executable(${PROJECT_NAME}
-  src/chat.c
-  src/main.c
+	src/chat.c
+	src/i18n.c
+	src/main.c
+	src/web_config.c
 )
 
 target_compile_options(${PROJECT_NAME} PRIVATE
@@ -87,8 +89,10 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   VERSION ${VITA_VERSION}
   NAME ${VITA_APP_NAME}
   FILE ${CMAKE_CURRENT_SOURCE_DIR}/README.md README.md
-  FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/vagaroute-logo.png sce_sys/icon0.png
+  FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon0.png sce_sys/icon0.png
   FILE ${CMAKE_CURRENT_SOURCE_DIR}/fondo.png sce_sys/livearea/contents/bg.png
+  FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/startup.png sce_sys/livearea/contents/startup.png
+  FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/template.xml sce_sys/livearea/contents/template.xml
   FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/vagaroute-logo.svg assets/vagaroute-logo.svg
   FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/vagaroute-logo.png assets/vagaroute-logo.png
   FILE ${CMAKE_CURRENT_SOURCE_DIR}/assets/Manrope.ttf assets/Manrope.ttf

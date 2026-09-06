@@ -32,17 +32,25 @@ El chat utiliza la API `chat/completions` compatible con OpenAI, recibe respuest
 - Pantalla inicial con teclado oficial de Vita para guardar el nombre del usuario.
 - Chat OpenAI-compatible con respuestas progresivas por streaming.
 - Historial local persistente de hasta cuatro conversaciones.
+- Biblioteca de titulos instalados con nombre, `TITLE_ID` y caratula.
+- Chats contextuales por titulo con cuatro sugerencias generadas por el modelo.
+- Interfaz disponible en espanol, ingles e italiano, con selector durante el inicio y en Ajustes.
+- Prompts del sistema localizados con contexto de PlayStation Vita y de titulos oficiales o homebrew.
 - Historial de mensajes en formato vertical con desplazamiento por botones y stick analogico.
 - Logs separados por sesion en `ux0:data/vagachatvita/logs` sin almacenar la API key.
 - Panel de ajustes con endpoint URL, API key enmascarada y modelos disponibles.
+- Configuracion web local desde Ajustes, con IP y puerto mostrados en la Vita.
+- Primera configuracion web protegida por contrasena; la API key nunca se devuelve en la pagina.
+- La API key se guarda en el archivo local en formato codificado y las configuraciones antiguas se migran al guardar.
 - Verificacion de conexion contra el endpoint configurado.
 - Navegacion con botones, pantalla tactil y teclado oficial de PlayStation Vita.
 - Renderizado 2D acelerado por GPU mediante `libvita2d`.
 - Tipografia Manrope incluida en el VPK con su licencia OFL.
 - Logo PNG y SVG empaquetados dentro de la aplicacion.
 - README incluido dentro del VPK para referencia desde VitaShell.
-- El icono de LiveArea usa `assets/vagaroute-logo.png`, el mismo logo que la interfaz.
+- El icono de LiveArea usa `assets/icon0.png`, generado a partir del logo de la interfaz.
 - El fondo de LiveArea usa `fondo.png` al abrir la burbuja de la aplicacion.
+- La plantilla LiveArea incluye `startup.png` y `template.xml` para completar el paquete oficial.
 - Generacion de ejecutables `.self` y paquetes `.vpk` para VitaShell.
 - Compilacion automatizada con GitHub Actions y la imagen oficial de VitaSDK.
 
@@ -133,6 +141,10 @@ La configuracion se guarda localmente en:
 ux0:data/VagaRouteAI/config.ini
 ```
 
+Desde `Ajustes > Configuracion web`, la Vita muestra una direccion como `http://192.168.1.20:8080`. Abrela desde un PC o telefono conectado a la misma red Wi-Fi. La primera visita solicita crear una contrasena; las siguientes requieren esa contrasena para cambiar el endpoint o la API key. El servidor solo se ejecuta mientras esta abierta esa pantalla.
+
+La pagina usa HTTP local, no HTTPS. No abras el puerto fuera de tu red de confianza y no introduzcas la API key desde una red publica.
+
 Los logs de cada ejecucion se guardan en:
 
 ```text
@@ -183,6 +195,10 @@ ux0:data/vagachatvita/logs/session-<tick>.log
 | Pantalla tactil | Editar nombre, endpoint, API key o abrir una opcion |
 | `CIRCULO` | Volver al chat |
 
+El boton `Configuracion web` abre una pantalla con la direccion local. En esa pantalla, `CIRCULO` o `CRUZ` en `Salir` detienen el servidor y regresan a Ajustes.
+
+En una conversacion nueva, `ARRIBA` / `ABAJO` recorren el campo de mensaje, enviar, modelo y preguntas rapidas. `IZQUIERDA` / `DERECHA` seleccionan una pregunta rapida y `CRUZ` la envia.
+
 </details>
 
 ## Estructura del proyecto
@@ -192,8 +208,11 @@ ux0:data/vagachatvita/logs/session-<tick>.log
 ├── fondo.png
 ├── assets/
 │   ├── cacert.pem
+│   ├── icon0.png
 │   ├── Manrope.ttf
 │   ├── OFL-Manrope.txt
+│   ├── startup.png
+│   ├── template.xml
 │   ├── vagaroute-logo.png
 │   └── vagaroute-logo.svg
 ├── scripts/
@@ -203,7 +222,11 @@ ux0:data/vagachatvita/logs/session-<tick>.log
 ├── src/
 │   ├── chat.c
 │   ├── chat.h
-│   └── main.c
+│   ├── i18n.c
+│   ├── i18n.h
+│   ├── main.c
+│   ├── web_config.c
+│   └── web_config.h
 ├── .github/workflows/build.yml
 ├── CMakeLists.txt
 └── README.md
